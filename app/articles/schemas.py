@@ -1,136 +1,132 @@
 from datetime import datetime
-from typing import List, Optional
+from typing import Optional, List
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, Field, ConfigDict, field_validator
 
-
-# Profile schema for author display
-class ProfileSchema(BaseModel):
-    username: str
-    bio: Optional[str] = None
-    image: Optional[str] = None
-    following: bool = False
-
-    model_config = ConfigDict(from_attributes=True)
+from app.profiles.schemas import ProfileResponse
 
 
-# Article Schemas
-class ArticleCreateSchema(BaseModel):
+class ArticleBase(BaseModel):
     title: str = Field(..., min_length=1, max_length=255)
-    description: str = Field(..., min_length=1, max_length=10000)
-    body: str = Field(..., min_length=1, max_length=100000)
-    tagList: Optional[List[str]] = Field(default_factory=list)
+    description: str = Field(..., min_length=1)
+    body: str = Field(..., min_length=1)
 
-    @field_validator('tagList')
-    @classmethod
-    def validate_tag_list(cls, v: Optional[List[str]]) -> List[str]:
-        if v is None:
-            return []
-        # Remove duplicates while preserving order, sanitize input
-        seen = set()
-        unique_tags = []
-        for tag in v:
-            if not tag or not isinstance(tag, str):
-                continue
-            # Strip whitespace and limit length
-            tag_clean = tag.strip()[:100]
-            tag_lower = tag_clean.lower()
-            if tag_lower and tag_lower not in seen:
-                seen.add(tag_lower)
-                unique_tags.append(tag_clean)
-        return unique_tags
+
+class ArticleCreate(ArticleBase):
+    tag_list: Optional[List[str]] = Field(default_factory=list, alias="tagList")
 
     model_config = ConfigDict(populate_by_name=True)
 
+    @field_validator('title')
+    @classmethod
+    def validate_title(cls, v: str) -> str:
+        if not v or not v.strip():
+            raise ValueError('Title cannot be empty')
+        return v.strip()
 
-class ArticleUpdateSchema(BaseModel):
+    @field_validator('body')
+    @classmethod
+    def validate_body(cls, v: str) -> str:
+        if not v or not v.strip():
+            raise ValueError('Body cannot be empty')
+        return v
+
+    @field_validator('description')
+    @classmethod
+    def validate_description(cls, v: str) -> str:
+        if not v or not v.strip():
+            raise ValueError('Description cannot be empty')
+        return v
+
+
+class ArticleUpdate(BaseModel):
     title: Optional[str] = Field(None, min_length=1, max_length=255)
-    description: Optional[str] = Field(None, min_length=1, max_length=10000)
-    body: Optional[str] = Field(None, min_length=1, max_length=100000)
-    tagList: Optional[List[str]] = None
-
-    @field_validator('tagList')
-    @classmethod
-    def validate_tag_list(cls, v: Optional[List[str]]) -> Optional[List[str]]:
-        if v is None:
-            return None
-        # Remove duplicates while preserving order, sanitize input
-        seen = set()
-        unique_tags = []
-        for tag in v:
-            if not tag or not isinstance(tag, str):
-                continue
-            # Strip whitespace and limit length
-            tag_clean = tag.strip()[:100]
-            tag_lower = tag_clean.lower()
-            if tag_lower and tag_lower not in seen:
-                seen.add(tag_lower)
-                unique_tags.append(tag_clean)
-        return unique_tags
+    description: Optional[str] = Field(None, min_length=1)
+    body: Optional[str] = Field(None, min_length=1)
+    tag_list: Optional[List[str]] = Field(default=None, alias="tagList")
 
     model_config = ConfigDict(populate_by_name=True)
 
+    @field_validator('title')
+    @classmethod
+    def validate_title(cls, v: Optional[str]) -> Optional[str]:
+        if v is not None and (not v or not v.strip()):
+            raise ValueError('Title cannot be empty')
+        return v.strip() if v else v
 
-class ArticleSchema(BaseModel):
+    @field_validator('body')
+    @classmethod
+    def validate_body(cls, v: Optional[str]) -> Optional[str]:
+        if v is not None and (not v or not v.strip()):
+            raise ValueError('Body cannot be empty')
+        return v
+
+    @field_validator('description')
+    @classmethod
+    def validate_description(cls, v: Optional[str]) -> Optional[str]:
+        if v is not None and (not v or not v.strip()):
+            raise ValueError('Description cannot be empty')
+        return v
+
+
+class ArticleResponse(BaseModel):
     slug: str
     title: str
     description: str
     body: str
-    tagList: List[str] = Field(default_factory=list)
-    createdAt: datetime
-    updatedAt: datetime
-    favorited: bool = False
-    favoritesCount: int = 0
-    author: ProfileSchema
+    tag_list: List[str] = Field(alias="tagList")
+    created_at: datetime = Field(alias="createdAt")
+    updated_at: datetime = Field(alias="updatedAt")
+    favorited: bool
+    favorites_count: int = Field(alias="favoritesCount")
+    author: ProfileResponse
 
     model_config = ConfigDict(from_attributes=True, populate_by_name=True)
 
 
-class ArticleResponseSchema(BaseModel):
-    article: ArticleSchema
+class ArticleResponseWrapper(BaseModel):
+    article: ArticleResponse
 
 
-class ArticleListResponseSchema(BaseModel):
-    articles: List[ArticleSchema]
-    articlesCount: int
+class MultipleArticlesResponse(BaseModel):
+    articles: List[ArticleResponse]
+    articles_count: int = Field(alias="articlesCount")
+
+    model_config = ConfigDict(populate_by_name=True)
 
 
-# Comment Schemas
-class CommentCreateSchema(BaseModel):
-    body: str = Field(..., min_length=1, max_length=10000)
+class CommentBase(BaseModel):
+    body: str = Field(..., min_length=1)
+
+    @field_validator('body')
+    @classmethod
+    def validate_body(cls, v: str) -> str:
+        if not v or not v.strip():
+            raise ValueError('Comment body cannot be empty')
+        return v
 
 
-class CommentSchema(BaseModel):
+class CommentCreate(CommentBase):
+    pass
+
+
+class CommentResponse(BaseModel):
     id: int
-    createdAt: datetime
-    updatedAt: datetime
     body: str
-    author: ProfileSchema
+    created_at: datetime = Field(alias="createdAt")
+    updated_at: datetime = Field(alias="updatedAt")
+    author: ProfileResponse
 
     model_config = ConfigDict(from_attributes=True, populate_by_name=True)
 
 
-class CommentResponseSchema(BaseModel):
-    comment: CommentSchema
+class CommentResponseWrapper(BaseModel):
+    comment: CommentResponse
 
 
-class CommentListResponseSchema(BaseModel):
-    comments: List[CommentSchema]
+class MultipleCommentsResponse(BaseModel):
+    comments: List[CommentResponse]
 
 
-# Tag Schemas
-class TagListResponseSchema(BaseModel):
+class TagsResponse(BaseModel):
     tags: List[str]
-
-
-# Request wrappers for API endpoints
-class ArticleCreateRequest(BaseModel):
-    article: ArticleCreateSchema
-
-
-class ArticleUpdateRequest(BaseModel):
-    article: ArticleUpdateSchema
-
-
-class CommentCreateRequest(BaseModel):
-    comment: CommentCreateSchema

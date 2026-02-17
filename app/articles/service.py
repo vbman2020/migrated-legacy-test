@@ -1,935 +1,562 @@
-import logging
 import secrets
-import string
-from typing import List, Optional, Tuple
-
-from fastapi import HTTPException, status
+from datetime import datetime, timezone
+from typing import Optional, List, Tuple
 from slugify import slugify
-from sqlalchemy import func, select
-from sqlalchemy.exc import IntegrityError
+
+from sqlalchemy import select, func, delete, insert
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import selectinload
+from sqlalchemy.orm import selectinload, joinedload
+from sqlalchemy.exc import IntegrityError
 
+from app.articles.models import Article, Comment, Tag, article_favorites
+from app.articles.schemas import ArticleCreate, ArticleUpdate, CommentCreate, ArticleResponse, CommentResponse
 from app.auth.models import User
-
-from .models import Article, Comment, Tag
-from .schemas import (
-    ArticleCreateSchema,
-    ArticleSchema,
-    ArticleUpdateSchema,
-    CommentCreateSchema,
-    CommentSchema,
-    ProfileSchema,
-)
-
-logger = logging.getLogger(__name__)
+from app.profiles.schemas import ProfileResponse
 
 
-def generate_random_string(length: int = 6) -> str:
-    """
-    Generate a random string for unique slug suffix.
-    Uses secrets module for cryptographically strong randomness.
-    
-    Args:
-        length: Length of the random string (default: 6)
-    
-    Returns:
-        Random alphanumeric string in lowercase
-    """
-    alphabet = string.ascii_lowercase + string.digits
-    return ''.join(secrets.choice(alphabet) for _ in range(length))
+def generate_random_string(length: int = 8) -> str:
+    """Generate a random string for unique slug suffixes using token_hex for predictable length."""
+    return secrets.token_hex(length // 2)[:length].lower()
 
 
-def generate_slug(title: str, max_length: int = 255) -> str:
-    """
-    Generate a unique slug from title with random suffix.
+async def generate_unique_slug(db: AsyncSession, title: str, max_length: int = 255, max_retries: int = 10) -> str:
+    """Generate a unique slug from a title with collision retry logic."""
+    base_slug = slugify(title)
     
-    Args:
-        title: Article title to slugify
-        max_length: Maximum length of the slug (default: 255)
+    if len(base_slug) > max_length:
+        base_slug = base_slug[:max_length]
     
-    Returns:
-        Slugified title with random suffix
-    """
-    # Sanitize and slugify the title
-    base_slug = slugify(title, max_length=max_length - 7)  # Leave room for suffix
-    
-    if not base_slug:
-        base_slug = "article"
-    
-    unique_suffix = generate_random_string()
-    
-    # Ensure the combined slug + suffix doesn't exceed max_length
-    while len(base_slug + '-' + unique_suffix) > max_length:
-        parts = base_slug.split('-')
-        if len(parts) == 1:
-            # No hyphens, truncate arbitrarily
-            base_slug = base_slug[:max_length - len(unique_suffix) - 1]
-        else:
-            # Remove last part
-            base_slug = '-'.join(parts[:-1])
-    
-    return f"{base_slug}-{unique_suffix}"
-
-
-class ArticleService:
-    """
-    Service layer for article-related operations.
-    Handles business logic for CRUD operations, favoriting, and feed generation.
-    """
-    
-    def __init__(self, db: AsyncSession):
-        self.db = db
-
-    async def _get_or_create_tags(self, tag_names: List[str]) -> List[Tag]:
-        """
-        Get or create tags by name with race condition handling.
+    for attempt in range(max_retries):
+        unique = generate_random_string()
         
-        Args:
-            tag_names: List of tag names to get or create
+        # Calculate available space for base slug
+        while len(base_slug + '-' + unique) > max_length:
+            parts = base_slug.split('-')
+            if len(parts) == 1:
+                # No hyphens, remove characters from the end
+                base_slug = base_slug[:max_length - len(unique) - 1]
+            else:
+                base_slug = '-'.join(parts[:-1])
         
-        Returns:
-            List of Tag objects
-        """
-        if not tag_names:
-            return []
+        slug = base_slug + '-' + unique
         
-        tags = []
-        for tag_name in tag_names:
-            # Sanitize tag name
-            tag_name_clean = tag_name.strip()[:100]
-            if not tag_name_clean:
-                continue
-                
-            tag_slug = tag_name_clean.lower()
+        # Check if slug exists
+        result = await db.execute(
+            select(Article.id).where(Article.slug == slug)
+        )
+        if result.scalar_one_or_none() is None:
+            return slug
+    
+    # If we exhausted retries, raise an error
+    raise ValueError(f"Unable to generate unique slug after {max_retries} attempts")
+
+
+async def get_or_create_tags(db: AsyncSession, tag_names: List[str]) -> List[Tag]:
+    """Get existing tags or create new ones."""
+    tags = []
+    for tag_name in tag_names:
+        tag_slug = slugify(tag_name)
+        
+        # Try to get existing tag by slug
+        result = await db.execute(
+            select(Tag).where(Tag.slug == tag_slug)
+        )
+        tag = result.scalar_one_or_none()
+        
+        if not tag:
+            # Create new tag
+            tag = Tag(tag=tag_name, slug=tag_slug)
+            db.add(tag)
             try:
-                # Try to find existing tag using parameterized query
-                result = await self.db.execute(
+                await db.flush()
+            except IntegrityError:
+                # Handle race condition - tag was created by another request
+                await db.rollback()
+                result = await db.execute(
                     select(Tag).where(Tag.slug == tag_slug)
                 )
                 tag = result.scalar_one_or_none()
-                
                 if not tag:
-                    # Create new tag
-                    tag = Tag(tag=tag_name_clean, slug=tag_slug)
-                    self.db.add(tag)
-                    try:
-                        await self.db.flush()
-                    except IntegrityError:
-                        # Handle race condition where tag was created by another request
-                        await self.db.rollback()
-                        result = await self.db.execute(
-                            select(Tag).where(Tag.slug == tag_slug)
-                        )
-                        tag = result.scalar_one_or_none()
-                        if not tag:
-                            # If still not found, log and skip this tag
-                            logger.error(f"Failed to create or retrieve tag with slug: {tag_slug}")
-                            continue
-                
-                tags.append(tag)
-            except IntegrityError as e:
-                # Log integrity errors without exposing details
-                logger.error(f"IntegrityError while processing tag: {str(e)}")
-                await self.db.rollback()
-                raise HTTPException(
-                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                    detail="Failed to process tags"
-                )
-            except Exception as e:
-                logger.error(f"Error processing tag: {str(e)}")
-                raise HTTPException(
-                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                    detail="Failed to process tags"
-                )
+                    raise
         
-        return tags
-
-    def _is_favorited_by_user(self, article: Article, user: Optional[User]) -> bool:
-        """
-        Check if article is favorited by user.
-        
-        Args:
-            article: Article to check
-            user: User to check for (optional)
-        
-        Returns:
-            True if favorited, False otherwise
-        """
-        if not user:
-            return False
-        return any(fav_user.id == user.id for fav_user in article.favorited_by)
-
-    def _is_following_author(self, author: User, current_user: Optional[User]) -> bool:
-        """
-        Check if current user is following the author.
-        
-        Args:
-            author: Author to check
-            current_user: Current user (optional)
-        
-        Returns:
-            True if following, False otherwise
-        """
-        if not current_user:
-            return False
-        return any(followed.id == author.id for followed in current_user.following)
-
-    def _article_to_schema(self, article: Article, current_user: Optional[User]) -> ArticleSchema:
-        """
-        Convert Article model to ArticleSchema.
-        
-        Args:
-            article: Article model instance
-            current_user: Current user for favorited/following flags (optional)
-        
-        Returns:
-            ArticleSchema instance
-        """
-        return ArticleSchema(
-            slug=article.slug,
-            title=article.title,
-            description=article.description,
-            body=article.body,
-            tagList=[tag.tag for tag in article.tags],
-            createdAt=article.created_at,
-            updatedAt=article.updated_at,
-            favorited=self._is_favorited_by_user(article, current_user),
-            favoritesCount=len(article.favorited_by),
-            author=ProfileSchema(
-                username=article.author.username,
-                bio=article.author.bio,
-                image=article.author.image,
-                following=self._is_following_author(article.author, current_user),
-            ),
-        )
-
-    async def list_articles(
-        self,
-        tag: Optional[str] = None,
-        author: Optional[str] = None,
-        favorited: Optional[str] = None,
-        limit: int = 20,
-        offset: int = 0,
-        current_user: Optional[User] = None,
-    ) -> Tuple[List[ArticleSchema], int]:
-        """
-        List articles with optional filtering.
-        
-        Args:
-            tag: Filter by tag name
-            author: Filter by author username
-            favorited: Filter by username who favorited
-            limit: Number of articles to return
-            offset: Number of articles to skip
-            current_user: Current user for favorited/following flags
-        
-        Returns:
-            Tuple of (list of ArticleSchema, total count)
-        """
-        try:
-            # Build base query with relationships
-            query = (
-                select(Article)
-                .options(
-                    selectinload(Article.author).selectinload(User.following),
-                    selectinload(Article.tags),
-                    selectinload(Article.favorited_by),
-                )
-            )
-
-            # Apply filters using parameterized queries
-            if tag:
-                query = query.join(Article.tags).where(Tag.tag == tag)
-            
-            if author:
-                query = query.join(Article.author).where(User.username == author)
-            
-            if favorited:
-                query = query.join(Article.favorited_by).where(User.username == favorited)
-
-            # Get total count
-            count_query = select(func.count()).select_from(query.subquery())
-            total_result = await self.db.execute(count_query)
-            total_count = total_result.scalar_one()
-
-            # Apply ordering, limit, and offset
-            query = query.order_by(Article.created_at.desc()).limit(limit).offset(offset)
-            
-            result = await self.db.execute(query)
-            articles = result.scalars().unique().all()
-
-            article_schemas = [
-                self._article_to_schema(article, current_user) for article in articles
-            ]
-
-            return article_schemas, total_count
-        except Exception as e:
-            logger.error(f"Error listing articles: {str(e)}")
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Failed to retrieve articles"
-            )
-
-    async def get_feed(
-        self,
-        current_user: User,
-        limit: int = 20,
-        offset: int = 0,
-    ) -> Tuple[List[ArticleSchema], int]:
-        """
-        Get articles from followed users (feed).
-        
-        Args:
-            current_user: Current authenticated user
-            limit: Number of articles to return
-            offset: Number of articles to skip
-        
-        Returns:
-            Tuple of (list of ArticleSchema, total count)
-        """
-        try:
-            # Get list of followed user IDs
-            followed_ids = [user.id for user in current_user.following]
-            
-            if not followed_ids:
-                return [], 0
-
-            # Build query for articles by followed users
-            query = (
-                select(Article)
-                .options(
-                    selectinload(Article.author).selectinload(User.following),
-                    selectinload(Article.tags),
-                    selectinload(Article.favorited_by),
-                )
-                .where(Article.author_id.in_(followed_ids))
-            )
-
-            # Get total count
-            count_query = select(func.count()).select_from(query.subquery())
-            total_result = await self.db.execute(count_query)
-            total_count = total_result.scalar_one()
-
-            # Apply ordering, limit, and offset
-            query = query.order_by(Article.created_at.desc()).limit(limit).offset(offset)
-            
-            result = await self.db.execute(query)
-            articles = result.scalars().all()
-
-            article_schemas = [
-                self._article_to_schema(article, current_user) for article in articles
-            ]
-
-            return article_schemas, total_count
-        except Exception as e:
-            logger.error(f"Error retrieving feed for user {current_user.id}: {str(e)}")
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Failed to retrieve feed"
-            )
-
-    async def create_article(
-        self,
-        article_data: ArticleCreateSchema,
-        author: User,
-    ) -> ArticleSchema:
-        """
-        Create a new article.
-        
-        Args:
-            article_data: Article creation data
-            author: Article author
-        
-        Returns:
-            Created ArticleSchema
-        """
-        try:
-            # Generate unique slug with retry logic
-            max_retries = 10
-            slug = None
-            for attempt in range(max_retries):
-                candidate_slug = generate_slug(article_data.title)
-                # Check if slug exists
-                result = await self.db.execute(
-                    select(Article).where(Article.slug == candidate_slug)
-                )
-                existing = result.scalar_one_or_none()
-                if not existing:
-                    slug = candidate_slug
-                    break
-            
-            if not slug:
-                logger.error(f"Failed to generate unique slug after {max_retries} attempts")
-                raise HTTPException(
-                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                    detail="Failed to generate unique slug"
-                )
-            
-            # Get or create tags
-            tags = await self._get_or_create_tags(article_data.tagList or [])
-            
-            # Create article
-            article = Article(
-                slug=slug,
-                title=article_data.title,
-                description=article_data.description,
-                body=article_data.body,
-                author_id=author.id,
-                tags=tags,
-            )
-            
-            self.db.add(article)
-            await self.db.commit()
-            await self.db.refresh(article)
-            
-            # Load relationships
-            await self.db.refresh(article, ["author", "tags", "favorited_by"])
-            # Load author's following for profile
-            await self.db.refresh(article.author, ["following"])
-            
-            logger.info(f"Article created: {article.slug} by user {author.id}")
-            return self._article_to_schema(article, author)
-        except HTTPException:
-            raise
-        except Exception as e:
-            await self.db.rollback()
-            logger.error(f"Error creating article: {str(e)}")
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Failed to create article"
-            )
-
-    async def get_article_by_slug(
-        self,
-        slug: str,
-        current_user: Optional[User] = None,
-    ) -> Optional[ArticleSchema]:
-        """
-        Get an article by slug.
-        
-        Args:
-            slug: Article slug
-            current_user: Current user for favorited/following flags
-        
-        Returns:
-            ArticleSchema if found, None otherwise
-        """
-        try:
-            result = await self.db.execute(
-                select(Article)
-                .options(
-                    selectinload(Article.author).selectinload(User.following),
-                    selectinload(Article.tags),
-                    selectinload(Article.favorited_by),
-                )
-                .where(Article.slug == slug)
-            )
-            article = result.scalar_one_or_none()
-            
-            if not article:
-                return None
-            
-            return self._article_to_schema(article, current_user)
-        except Exception as e:
-            logger.error(f"Error retrieving article {slug}: {str(e)}")
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Failed to retrieve article"
-            )
-
-    async def update_article(
-        self,
-        slug: str,
-        article_data: ArticleUpdateSchema,
-        current_user: User,
-    ) -> ArticleSchema:
-        """
-        Update an article.
-        
-        Args:
-            slug: Article slug
-            article_data: Article update data
-            current_user: Current user (must be author)
-        
-        Returns:
-            Updated ArticleSchema
-        """
-        try:
-            result = await self.db.execute(
-                select(Article)
-                .options(
-                    selectinload(Article.author).selectinload(User.following),
-                    selectinload(Article.tags),
-                    selectinload(Article.favorited_by),
-                )
-                .where(Article.slug == slug)
-            )
-            article = result.scalar_one_or_none()
-            
-            if not article:
-                raise HTTPException(
-                    status_code=status.HTTP_404_NOT_FOUND,
-                    detail="An article with this slug does not exist.",
-                )
-            
-            # Check ownership
-            if article.author_id != current_user.id:
-                raise HTTPException(
-                    status_code=status.HTTP_403_FORBIDDEN,
-                    detail="You are not allowed to update this article.",
-                )
-            
-            # Update fields
-            if article_data.title is not None:
-                article.title = article_data.title
-                # Regenerate slug if title changed with retry logic
-                max_retries = 10
-                new_slug = None
-                for attempt in range(max_retries):
-                    candidate_slug = generate_slug(article_data.title)
-                    if candidate_slug == article.slug:
-                        new_slug = candidate_slug
-                        break
-                    # Check if slug exists
-                    result = await self.db.execute(
-                        select(Article).where(Article.slug == candidate_slug)
-                    )
-                    existing = result.scalar_one_or_none()
-                    if not existing:
-                        new_slug = candidate_slug
-                        break
-                
-                if not new_slug:
-                    logger.error(f"Failed to generate unique slug after {max_retries} attempts")
-                    raise HTTPException(
-                        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                        detail="Failed to generate unique slug"
-                    )
-                article.slug = new_slug
-            
-            if article_data.description is not None:
-                article.description = article_data.description
-            
-            if article_data.body is not None:
-                article.body = article_data.body
-            
-            if article_data.tagList is not None:
-                tags = await self._get_or_create_tags(article_data.tagList)
-                article.tags = tags
-            
-            await self.db.commit()
-            await self.db.refresh(article)
-            await self.db.refresh(article, ["author", "tags", "favorited_by"])
-            await self.db.refresh(article.author, ["following"])
-            
-            logger.info(f"Article updated: {article.slug} by user {current_user.id}")
-            return self._article_to_schema(article, current_user)
-        except HTTPException:
-            raise
-        except Exception as e:
-            await self.db.rollback()
-            logger.error(f"Error updating article {slug}: {str(e)}")
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Failed to update article"
-            )
-
-    async def delete_article(
-        self,
-        slug: str,
-        current_user: User,
-    ) -> None:
-        """
-        Delete an article.
-        
-        Args:
-            slug: Article slug
-            current_user: Current user (must be author)
-        """
-        try:
-            result = await self.db.execute(
-                select(Article).where(Article.slug == slug)
-            )
-            article = result.scalar_one_or_none()
-            
-            if not article:
-                raise HTTPException(
-                    status_code=status.HTTP_404_NOT_FOUND,
-                    detail="An article with this slug does not exist.",
-                )
-            
-            # Check ownership
-            if article.author_id != current_user.id:
-                raise HTTPException(
-                    status_code=status.HTTP_403_FORBIDDEN,
-                    detail="You are not allowed to delete this article.",
-                )
-            
-            await self.db.delete(article)
-            await self.db.commit()
-            
-            logger.info(f"Article deleted: {slug} by user {current_user.id}")
-        except HTTPException:
-            raise
-        except Exception as e:
-            await self.db.rollback()
-            logger.error(f"Error deleting article {slug}: {str(e)}")
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Failed to delete article"
-            )
-
-    async def favorite_article(
-        self,
-        slug: str,
-        current_user: User,
-    ) -> ArticleSchema:
-        """
-        Favorite an article.
-        
-        Args:
-            slug: Article slug
-            current_user: Current user
-        
-        Returns:
-            Updated ArticleSchema
-        """
-        try:
-            result = await self.db.execute(
-                select(Article)
-                .options(
-                    selectinload(Article.author).selectinload(User.following),
-                    selectinload(Article.tags),
-                    selectinload(Article.favorited_by),
-                )
-                .where(Article.slug == slug)
-            )
-            article = result.scalar_one_or_none()
-            
-            if not article:
-                raise HTTPException(
-                    status_code=status.HTTP_404_NOT_FOUND,
-                    detail="An article with this slug does not exist.",
-                )
-            
-            # Check if already favorited
-            if not self._is_favorited_by_user(article, current_user):
-                article.favorited_by.append(current_user)
-                await self.db.commit()
-                await self.db.refresh(article)
-                await self.db.refresh(article, ["author", "tags", "favorited_by"])
-                await self.db.refresh(article.author, ["following"])
-                logger.info(f"Article favorited: {slug} by user {current_user.id}")
-            
-            return self._article_to_schema(article, current_user)
-        except HTTPException:
-            raise
-        except Exception as e:
-            await self.db.rollback()
-            logger.error(f"Error favoriting article {slug}: {str(e)}")
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Failed to favorite article"
-            )
-
-    async def unfavorite_article(
-        self,
-        slug: str,
-        current_user: User,
-    ) -> ArticleSchema:
-        """
-        Unfavorite an article.
-        
-        Args:
-            slug: Article slug
-            current_user: Current user
-        
-        Returns:
-            Updated ArticleSchema
-        """
-        try:
-            result = await self.db.execute(
-                select(Article)
-                .options(
-                    selectinload(Article.author).selectinload(User.following),
-                    selectinload(Article.tags),
-                    selectinload(Article.favorited_by),
-                )
-                .where(Article.slug == slug)
-            )
-            article = result.scalar_one_or_none()
-            
-            if not article:
-                raise HTTPException(
-                    status_code=status.HTTP_404_NOT_FOUND,
-                    detail="An article with this slug does not exist.",
-                )
-            
-            # Check if favorited
-            if self._is_favorited_by_user(article, current_user):
-                article.favorited_by = [
-                    user for user in article.favorited_by if user.id != current_user.id
-                ]
-                await self.db.commit()
-                await self.db.refresh(article)
-                await self.db.refresh(article, ["author", "tags", "favorited_by"])
-                await self.db.refresh(article.author, ["following"])
-                logger.info(f"Article unfavorited: {slug} by user {current_user.id}")
-            
-            return self._article_to_schema(article, current_user)
-        except HTTPException:
-            raise
-        except Exception as e:
-            await self.db.rollback()
-            logger.error(f"Error unfavoriting article {slug}: {str(e)}")
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Failed to unfavorite article"
-            )
-
-
-class CommentService:
-    """
-    Service layer for comment-related operations.
-    Handles business logic for adding, retrieving, and deleting comments.
-    """
+        tags.append(tag)
     
-    def __init__(self, db: AsyncSession):
-        self.db = db
-
-    def _is_following_author(self, author: User, current_user: Optional[User]) -> bool:
-        """
-        Check if current user is following the author.
-        
-        Args:
-            author: Author to check
-            current_user: Current user (optional)
-        
-        Returns:
-            True if following, False otherwise
-        """
-        if not current_user:
-            return False
-        return any(followed.id == author.id for followed in current_user.following)
-
-    def _comment_to_schema(self, comment: Comment, current_user: Optional[User]) -> CommentSchema:
-        """
-        Convert Comment model to CommentSchema.
-        
-        Args:
-            comment: Comment model instance
-            current_user: Current user for following flag (optional)
-        
-        Returns:
-            CommentSchema instance
-        """
-        return CommentSchema(
-            id=comment.id,
-            createdAt=comment.created_at,
-            updatedAt=comment.updated_at,
-            body=comment.body,
-            author=ProfileSchema(
-                username=comment.author.username,
-                bio=comment.author.bio,
-                image=comment.author.image,
-                following=self._is_following_author(comment.author, current_user),
-            ),
-        )
-
-    async def get_comments_for_article(
-        self,
-        slug: str,
-        current_user: Optional[User] = None,
-    ) -> List[CommentSchema]:
-        """
-        Get all comments for an article.
-        
-        Args:
-            slug: Article slug
-            current_user: Current user for following flags
-        
-        Returns:
-            List of CommentSchema
-        """
-        try:
-            # First, get the article
-            article_result = await self.db.execute(
-                select(Article).where(Article.slug == slug)
-            )
-            article = article_result.scalar_one_or_none()
-            
-            if not article:
-                raise HTTPException(
-                    status_code=status.HTTP_404_NOT_FOUND,
-                    detail="An article with this slug does not exist.",
-                )
-            
-            # Get comments
-            result = await self.db.execute(
-                select(Comment)
-                .options(
-                    selectinload(Comment.author).selectinload(User.following),
-                )
-                .where(Comment.article_id == article.id)
-                .order_by(Comment.created_at.desc())
-            )
-            comments = result.scalars().all()
-            
-            return [self._comment_to_schema(comment, current_user) for comment in comments]
-        except HTTPException:
-            raise
-        except Exception as e:
-            logger.error(f"Error retrieving comments for article {slug}: {str(e)}")
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Failed to retrieve comments"
-            )
-
-    async def add_comment(
-        self,
-        slug: str,
-        comment_data: CommentCreateSchema,
-        author: User,
-    ) -> CommentSchema:
-        """
-        Add a comment to an article.
-        
-        Args:
-            slug: Article slug
-            comment_data: Comment creation data
-            author: Comment author
-        
-        Returns:
-            Created CommentSchema
-        """
-        try:
-            # First, get the article
-            article_result = await self.db.execute(
-                select(Article).where(Article.slug == slug)
-            )
-            article = article_result.scalar_one_or_none()
-            
-            if not article:
-                raise HTTPException(
-                    status_code=status.HTTP_404_NOT_FOUND,
-                    detail="An article with this slug does not exist.",
-                )
-            
-            # Create comment
-            comment = Comment(
-                body=comment_data.body,
-                article_id=article.id,
-                author_id=author.id,
-            )
-            
-            self.db.add(comment)
-            await self.db.commit()
-            await self.db.refresh(comment)
-            await self.db.refresh(comment, ["author"])
-            await self.db.refresh(comment.author, ["following"])
-            
-            logger.info(f"Comment added to article {slug} by user {author.id}")
-            return self._comment_to_schema(comment, author)
-        except HTTPException:
-            raise
-        except Exception as e:
-            await self.db.rollback()
-            logger.error(f"Error adding comment to article {slug}: {str(e)}")
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Failed to add comment"
-            )
-
-    async def delete_comment(
-        self,
-        slug: str,
-        comment_id: int,
-        current_user: User,
-    ) -> None:
-        """
-        Delete a comment.
-        
-        Args:
-            slug: Article slug
-            comment_id: Comment ID
-            current_user: Current user (must be author)
-        """
-        try:
-            # First, verify the article exists
-            article_result = await self.db.execute(
-                select(Article).where(Article.slug == slug)
-            )
-            article = article_result.scalar_one_or_none()
-            
-            if not article:
-                raise HTTPException(
-                    status_code=status.HTTP_404_NOT_FOUND,
-                    detail="An article with this slug does not exist.",
-                )
-            
-            # Get the comment and verify it belongs to the article
-            result = await self.db.execute(
-                select(Comment)
-                .where(Comment.id == comment_id)
-                .where(Comment.article_id == article.id)
-            )
-            comment = result.scalar_one_or_none()
-            
-            if not comment:
-                raise HTTPException(
-                    status_code=status.HTTP_404_NOT_FOUND,
-                    detail="A comment with this ID does not exist for this article.",
-                )
-            
-            # Check ownership
-            if comment.author_id != current_user.id:
-                raise HTTPException(
-                    status_code=status.HTTP_403_FORBIDDEN,
-                    detail="You are not allowed to delete this comment.",
-                )
-            
-            await self.db.delete(comment)
-            await self.db.commit()
-            
-            logger.info(f"Comment {comment_id} deleted from article {slug} by user {current_user.id}")
-        except HTTPException:
-            raise
-        except Exception as e:
-            await self.db.rollback()
-            logger.error(f"Error deleting comment {comment_id} from article {slug}: {str(e)}")
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Failed to delete comment"
-            )
+    return tags
 
 
-class TagService:
-    """
-    Service layer for tag-related operations.
-    Handles business logic for retrieving tags.
-    """
+async def get_articles(
+    db: AsyncSession,
+    tag: Optional[str] = None,
+    author: Optional[str] = None,
+    favorited: Optional[str] = None,
+    limit: int = 20,
+    offset: int = 0,
+    current_user: Optional[User] = None,
+) -> Tuple[List[Article], int]:
+    """Get articles with optional filtering."""
+    query = select(Article).options(
+        joinedload(Article.author),
+        selectinload(Article.tags),
+        selectinload(Article.favorited_by),
+    )
     
-    def __init__(self, db: AsyncSession):
-        self.db = db
+    # Apply filters
+    if author:
+        query = query.join(Article.author).where(User.username == author)
+    
+    if tag:
+        tag_slug = slugify(tag)
+        query = query.join(Article.tags).where(Tag.slug == tag_slug)
+    
+    if favorited:
+        query = query.join(Article.favorited_by).where(User.username == favorited)
+    
+    # Get total count - use a more efficient count query
+    count_query = select(func.count(Article.id))
+    if author:
+        count_query = count_query.select_from(Article).join(Article.author).where(User.username == author)
+    elif tag:
+        tag_slug = slugify(tag)
+        count_query = count_query.select_from(Article).join(Article.tags).where(Tag.slug == tag_slug)
+    elif favorited:
+        count_query = count_query.select_from(Article).join(Article.favorited_by).where(User.username == favorited)
+    else:
+        count_query = count_query.select_from(Article)
+    
+    total_result = await db.execute(count_query)
+    total_count = total_result.scalar_one()
+    
+    # Apply pagination and ordering
+    query = query.order_by(Article.created_at.desc()).limit(limit).offset(offset)
+    
+    result = await db.execute(query)
+    articles = result.unique().scalars().all()
+    
+    return list(articles), total_count
 
-    async def get_all_tags(self) -> List[str]:
-        """
-        Get list of all tags.
-        
-        Returns:
-            List of tag names
-        """
-        try:
-            result = await self.db.execute(
-                select(Tag).order_by(Tag.tag)
+
+async def get_feed(
+    db: AsyncSession,
+    user: User,
+    limit: int = 20,
+    offset: int = 0,
+) -> Tuple[List[Article], int]:
+    """Get articles from followed users."""
+    # Get the list of followed user IDs
+    from app.profiles.models import followers_association
+    
+    followed_ids_query = select(followers_association.c.followed_id).where(
+        followers_association.c.follower_id == user.id
+    )
+    
+    query = select(Article).options(
+        joinedload(Article.author),
+        selectinload(Article.tags),
+        selectinload(Article.favorited_by),
+    ).where(Article.author_id.in_(followed_ids_query))
+    
+    # Get total count - more efficient query
+    count_query = select(func.count(Article.id)).where(Article.author_id.in_(followed_ids_query))
+    total_result = await db.execute(count_query)
+    total_count = total_result.scalar_one()
+    
+    # Apply pagination and ordering
+    query = query.order_by(Article.created_at.desc()).limit(limit).offset(offset)
+    
+    result = await db.execute(query)
+    articles = result.unique().scalars().all()
+    
+    return list(articles), total_count
+
+
+async def create_article(
+    db: AsyncSession,
+    article_data: ArticleCreate,
+    author: User,
+) -> Article:
+    """Create a new article."""
+    # Generate unique slug
+    slug = await generate_unique_slug(db, article_data.title)
+    
+    # Create article
+    article = Article(
+        slug=slug,
+        title=article_data.title,
+        description=article_data.description,
+        body=article_data.body,
+        author_id=author.id,
+    )
+    
+    db.add(article)
+    await db.flush()
+    
+    # Add tags
+    if article_data.tag_list:
+        tags = await get_or_create_tags(db, article_data.tag_list)
+        article.tags = tags
+    
+    await db.commit()
+    await db.refresh(article)
+    
+    return article
+
+
+async def get_article_by_slug(db: AsyncSession, slug: str) -> Optional[Article]:
+    """Get an article by slug."""
+    result = await db.execute(
+        select(Article)
+        .options(
+            joinedload(Article.author),
+            selectinload(Article.tags),
+            selectinload(Article.favorited_by),
+        )
+        .where(Article.slug == slug)
+    )
+    return result.unique().scalar_one_or_none()
+
+
+async def update_article(
+    db: AsyncSession,
+    article: Article,
+    article_data: ArticleUpdate,
+) -> Article:
+    """Update an article. Keeps original slug to avoid breaking links."""
+    update_data = article_data.model_dump(exclude_unset=True, by_alias=False)
+    
+    # Handle tag updates separately
+    tag_list = update_data.pop('tag_list', None)
+    
+    # Update fields but keep original slug even if title changes
+    for key, value in update_data.items():
+        setattr(article, key, value)
+    
+    # Update tags if provided
+    if tag_list is not None:
+        tags = await get_or_create_tags(db, tag_list)
+        article.tags = tags
+    
+    article.updated_at = datetime.now(timezone.utc)
+    
+    await db.commit()
+    await db.refresh(article)
+    
+    return article
+
+
+async def delete_article(db: AsyncSession, article: Article) -> None:
+    """Delete an article. Comments are cascade deleted automatically."""
+    await db.delete(article)
+    await db.commit()
+
+
+async def favorite_article(db: AsyncSession, article: Article, user: User) -> None:
+    """Favorite an article using direct INSERT to avoid race conditions."""
+    # Use INSERT IGNORE pattern to handle concurrent favorites
+    try:
+        stmt = insert(article_favorites).values(
+            article_id=article.id,
+            user_id=user.id,
+        )
+        await db.execute(stmt)
+        await db.commit()
+    except IntegrityError:
+        # Already favorited, rollback and continue
+        await db.rollback()
+
+
+async def unfavorite_article(db: AsyncSession, article: Article, user: User) -> None:
+    """Unfavorite an article using direct DELETE to avoid race conditions."""
+    stmt = delete(article_favorites).where(
+        article_favorites.c.article_id == article.id,
+        article_favorites.c.user_id == user.id,
+    )
+    await db.execute(stmt)
+    await db.commit()
+
+
+async def get_comments_for_article(db: AsyncSession, article_id: int) -> List[Comment]:
+    """Get all comments for an article."""
+    result = await db.execute(
+        select(Comment)
+        .options(joinedload(Comment.author))
+        .where(Comment.article_id == article_id)
+        .order_by(Comment.created_at.desc())
+    )
+    return list(result.unique().scalars().all())
+
+
+async def create_comment(
+    db: AsyncSession,
+    article: Article,
+    comment_data: CommentCreate,
+    author: User,
+) -> Comment:
+    """Create a comment on an article."""
+    comment = Comment(
+        body=comment_data.body,
+        article_id=article.id,
+        author_id=author.id,
+    )
+    
+    db.add(comment)
+    await db.commit()
+    await db.refresh(comment)
+    
+    return comment
+
+
+async def get_comment_by_id(db: AsyncSession, comment_id: int) -> Optional[Comment]:
+    """Get a comment by ID."""
+    result = await db.execute(
+        select(Comment)
+        .options(joinedload(Comment.author))
+        .where(Comment.id == comment_id)
+    )
+    return result.unique().scalar_one_or_none()
+
+
+async def delete_comment(db: AsyncSession, comment: Comment) -> None:
+    """Delete a comment."""
+    await db.delete(comment)
+    await db.commit()
+
+
+async def get_all_tags(db: AsyncSession) -> List[str]:
+    """Get all unique tags."""
+    result = await db.execute(select(Tag.tag).order_by(Tag.tag))
+    return list(result.scalars().all())
+
+
+async def is_article_favorited_by_user(
+    db: AsyncSession,
+    article_id: int,
+    user_id: Optional[int],
+) -> bool:
+    """Check if an article is favorited by a user using efficient database query."""
+    if not user_id:
+        return False
+    
+    result = await db.execute(
+        select(func.count())
+        .select_from(article_favorites)
+        .where(
+            article_favorites.c.article_id == article_id,
+            article_favorites.c.user_id == user_id,
+        )
+    )
+    count = result.scalar_one()
+    return count > 0
+
+
+async def get_favorites_count(db: AsyncSession, article_id: int) -> int:
+    """Get the count of favorites for an article using efficient database query."""
+    result = await db.execute(
+        select(func.count())
+        .select_from(article_favorites)
+        .where(article_favorites.c.article_id == article_id)
+    )
+    return result.scalar_one()
+
+
+async def is_user_following(
+    db: AsyncSession,
+    current_user_id: Optional[int],
+    profile_user_id: int,
+) -> bool:
+    """Check if current user is following the profile user."""
+    if not current_user_id or current_user_id == profile_user_id:
+        return False
+    
+    from app.profiles.models import followers_association
+    
+    result = await db.execute(
+        select(func.count())
+        .select_from(followers_association)
+        .where(
+            followers_association.c.follower_id == current_user_id,
+            followers_association.c.followed_id == profile_user_id,
+        )
+    )
+    count = result.scalar_one()
+    return count > 0
+
+
+async def article_to_response(
+    article: Article,
+    current_user: Optional[User],
+    db: AsyncSession,
+) -> ArticleResponse:
+    """Convert an Article model to ArticleResponse schema."""
+    current_user_id = current_user.id if current_user else None
+    
+    favorited = await is_article_favorited_by_user(db, article.id, current_user_id)
+    favorites_count = await get_favorites_count(db, article.id)
+    following = await is_user_following(db, current_user_id, article.author_id)
+    
+    return ArticleResponse(
+        slug=article.slug,
+        title=article.title,
+        description=article.description,
+        body=article.body,
+        tag_list=[tag.tag for tag in article.tags],
+        created_at=article.created_at,
+        updated_at=article.updated_at,
+        favorited=favorited,
+        favorites_count=favorites_count,
+        author=ProfileResponse(
+            username=article.author.username,
+            bio=article.author.bio or "",
+            image=article.author.image or "",
+            following=following,
+        ),
+    )
+
+
+async def articles_to_response_batch(
+    articles: List[Article],
+    current_user: Optional[User],
+    db: AsyncSession,
+) -> List[ArticleResponse]:
+    """Batch convert articles to responses for better performance."""
+    if not articles:
+        return []
+    
+    current_user_id = current_user.id if current_user else None
+    article_ids = [article.id for article in articles]
+    author_ids = [article.author_id for article in articles]
+    
+    # Batch query for favorites
+    favorites_dict = {}
+    if current_user_id:
+        result = await db.execute(
+            select(article_favorites.c.article_id)
+            .where(
+                article_favorites.c.article_id.in_(article_ids),
+                article_favorites.c.user_id == current_user_id,
             )
-            tags = result.scalars().all()
-            
-            return [tag.tag for tag in tags]
-        except Exception as e:
-            logger.error(f"Error retrieving tags: {str(e)}")
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Failed to retrieve tags"
+        )
+        favorited_article_ids = set(result.scalars().all())
+        favorites_dict = {aid: aid in favorited_article_ids for aid in article_ids}
+    else:
+        favorites_dict = {aid: False for aid in article_ids}
+    
+    # Batch query for favorites counts
+    result = await db.execute(
+        select(article_favorites.c.article_id, func.count())
+        .where(article_favorites.c.article_id.in_(article_ids))
+        .group_by(article_favorites.c.article_id)
+    )
+    favorites_counts = dict(result.all())
+    
+    # Batch query for following relationships
+    following_dict = {}
+    if current_user_id:
+        from app.profiles.models import followers_association
+        result = await db.execute(
+            select(followers_association.c.followed_id)
+            .where(
+                followers_association.c.follower_id == current_user_id,
+                followers_association.c.followed_id.in_(author_ids),
             )
+        )
+        followed_ids = set(result.scalars().all())
+        following_dict = {aid: aid in followed_ids for aid in author_ids}
+    else:
+        following_dict = {aid: False for aid in author_ids}
+    
+    # Build responses
+    responses = []
+    for article in articles:
+        responses.append(
+            ArticleResponse(
+                slug=article.slug,
+                title=article.title,
+                description=article.description,
+                body=article.body,
+                tag_list=[tag.tag for tag in article.tags],
+                created_at=article.created_at,
+                updated_at=article.updated_at,
+                favorited=favorites_dict.get(article.id, False),
+                favorites_count=favorites_counts.get(article.id, 0),
+                author=ProfileResponse(
+                    username=article.author.username,
+                    bio=article.author.bio or "",
+                    image=article.author.image or "",
+                    following=following_dict.get(article.author_id, False),
+                ),
+            )
+        )
+    
+    return responses
+
+
+async def comment_to_response(
+    comment: Comment,
+    current_user: Optional[User],
+    db: AsyncSession,
+) -> CommentResponse:
+    """Convert a Comment model to CommentResponse schema."""
+    current_user_id = current_user.id if current_user else None
+    following = await is_user_following(db, current_user_id, comment.author_id)
+    
+    return CommentResponse(
+        id=comment.id,
+        body=comment.body,
+        created_at=comment.created_at,
+        updated_at=comment.updated_at,
+        author=ProfileResponse(
+            username=comment.author.username,
+            bio=comment.author.bio or "",
+            image=comment.author.image or "",
+            following=following,
+        ),
+    )
+
+
+async def comments_to_response_batch(
+    comments: List[Comment],
+    current_user: Optional[User],
+    db: AsyncSession,
+) -> List[CommentResponse]:
+    """Batch convert comments to responses for better performance."""
+    if not comments:
+        return []
+    
+    current_user_id = current_user.id if current_user else None
+    author_ids = [comment.author_id for comment in comments]
+    
+    # Batch query for following relationships
+    following_dict = {}
+    if current_user_id:
+        from app.profiles.models import followers_association
+        result = await db.execute(
+            select(followers_association.c.followed_id)
+            .where(
+                followers_association.c.follower_id == current_user_id,
+                followers_association.c.followed_id.in_(author_ids),
+            )
+        )
+        followed_ids = set(result.scalars().all())
+        following_dict = {aid: aid in followed_ids for aid in author_ids}
+    else:
+        following_dict = {aid: False for aid in author_ids}
+    
+    # Build responses
+    responses = []
+    for comment in comments:
+        responses.append(
+            CommentResponse(
+                id=comment.id,
+                body=comment.body,
+                created_at=comment.created_at,
+                updated_at=comment.updated_at,
+                author=ProfileResponse(
+                    username=comment.author.username,
+                    bio=comment.author.bio or "",
+                    image=comment.author.image or "",
+                    following=following_dict.get(comment.author_id, False),
+                ),
+            )
+        )
+    
+    return responses
