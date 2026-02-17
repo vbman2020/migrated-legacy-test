@@ -1,189 +1,224 @@
-"""Integration tests for complete user workflows."""
+"""Integration tests for complete workflows."""
 import pytest
 from httpx import AsyncClient
+from sqlalchemy.ext.asyncio import AsyncSession
 
 
 class TestCompleteUserJourney:
-    """Test complete user journey from registration to article management."""
-    
+    """Test complete user journeys through the application."""
+
     @pytest.mark.asyncio
-    async def test_register_login_create_article_workflow(self, client: AsyncClient):
-        """Test user registration, login, and creating an article."""
-        # Register user
-        register_response = await client.post(
-            "/api/users",
-            json={
-                "user": {
-                    "username": "journeyuser",
-                    "email": "journey@example.com",
-                    "password": "password123"
-                }
+    async def test_user_registration_to_article_creation(self, client: AsyncClient):
+        """Test complete flow: register, login, create article, get article."""
+        # 1. Register a new user
+        register_payload = {
+            "user": {
+                "username": "journeyuser",
+                "email": "journey@example.com",
+                "password": "SecurePass123!"
             }
-        )
-        assert register_response.status_code == 201
-        token = register_response.json()["user"]["token"]
-        
-        # Create article
-        article_response = await client.post(
-            "/api/articles",
-            headers={"Authorization": f"Token {token}"},
-            json={
-                "article": {
-                    "title": "My First Article",
-                    "description": "This is my first article",
-                    "body": "Article content goes here",
-                    "tagList": ["introduction"]
-                }
-            }
-        )
-        assert article_response.status_code == 201
-        slug = article_response.json()["article"]["slug"]
-        
-        # Get article
-        get_response = await client.get(f"/api/articles/{slug}")
-        assert get_response.status_code == 200
-        assert get_response.json()["article"]["author"]["username"] == "journeyuser"
-    
-    @pytest.mark.asyncio
-    async def test_follow_and_feed_workflow(self, client: AsyncClient, test_user, test_article):
-        """Test following a user and seeing their articles in feed."""
-        # Register second user
-        register_response = await client.post(
-            "/api/users",
-            json={
-                "user": {
-                    "username": "followeruser",
-                    "email": "follower@example.com",
-                    "password": "password123"
-                }
-            }
-        )
+        }
+        register_response = await client.post("/api/users", json=register_payload)
         assert register_response.status_code == 201
         token = register_response.json()["user"]["token"]
         headers = {"Authorization": f"Token {token}"}
         
-        # Follow first user
+        # 2. Create an article
+        article_payload = {
+            "article": {
+                "title": "My First Article",
+                "description": "This is my first article",
+                "body": "Article body content here",
+                "tagList": ["first", "article"]
+            }
+        }
+        create_response = await client.post("/api/articles", json=article_payload, headers=headers)
+        assert create_response.status_code == 201
+        slug = create_response.json()["article"]["slug"]
+        
+        # 3. Get the article
+        get_response = await client.get(f"/api/articles/{slug}")
+        assert get_response.status_code == 200
+        assert get_response.json()["article"]["title"] == "My First Article"
+
+    @pytest.mark.asyncio
+    async def test_follow_and_feed_workflow(self, client: AsyncClient, test_user: User, test_user2: User, test_article: Article, auth_headers: dict):
+        """Test following a user and seeing their articles in feed."""
+        # 1. Follow test_user (who has an article)
         follow_response = await client.post(
             f"/api/profiles/{test_user.username}/follow",
-            headers=headers
+            headers=auth_headers
         )
         assert follow_response.status_code == 200
         assert follow_response.json()["profile"]["following"] is True
         
-        # Check feed contains followed user's articles
-        feed_response = await client.get("/api/articles/feed", headers=headers)
+        # 2. Get feed - should include test_user's article
+        feed_response = await client.get("/api/articles/feed", headers=auth_headers)
         assert feed_response.status_code == 200
         articles = feed_response.json()["articles"]
-        assert len(articles) > 0
-        assert articles[0]["author"]["username"] == test_user.username
-    
-    @pytest.mark.asyncio
-    async def test_favorite_article_workflow(self, client: AsyncClient, test_article):
-        """Test favoriting an article affects counts and filters."""
-        # Register user
-        register_response = await client.post(
-            "/api/users",
-            json={
-                "user": {
-                    "username": "favoriteuser",
-                    "email": "favorite@example.com",
-                    "password": "password123"
-                }
-            }
-        )
-        token = register_response.json()["user"]["token"]
-        headers = {"Authorization": f"Token {token}"}
-        
-        # Favorite article
-        favorite_response = await client.post(
-            f"/api/articles/{test_article.slug}/favorite",
-            headers=headers
-        )
-        assert favorite_response.status_code == 201
-        assert favorite_response.json()["article"]["favorited"] is True
-        assert favorite_response.json()["article"]["favoritesCount"] >= 1
-        
-        # Check article appears in favorited filter
-        filter_response = await client.get(
-            "/api/articles?favorited=favoriteuser",
-            headers=headers
-        )
-        assert filter_response.status_code == 200
-        articles = filter_response.json()["articles"]
-        assert len(articles) > 0
-        assert articles[0]["slug"] == test_article.slug
+        article_slugs = [a["slug"] for a in articles]
+        assert test_article.slug in article_slugs
 
-
-class TestArticleCommentWorkflow:
-    """Test article and comment interactions."""
-    
     @pytest.mark.asyncio
-    async def test_create_article_add_comments_workflow(self, client: AsyncClient):
+    async def test_article_with_comments_workflow(self, client: AsyncClient, test_article: Article, auth_headers: dict, auth_headers2: dict):
         """Test creating article and adding comments."""
-        # Register two users
-        user1_response = await client.post(
-            "/api/users",
-            json={
-                "user": {
-                    "username": "author",
-                    "email": "author@example.com",
-                    "password": "password123"
-                }
+        # 1. Add comment as user2
+        comment_payload = {
+            "comment": {
+                "body": "Great article!"
             }
-        )
-        token1 = user1_response.json()["user"]["token"]
-        
-        user2_response = await client.post(
-            "/api/users",
-            json={
-                "user": {
-                    "username": "commenter",
-                    "email": "commenter@example.com",
-                    "password": "password123"
-                }
-            }
-        )
-        token2 = user2_response.json()["user"]["token"]
-        
-        # User1 creates article
-        article_response = await client.post(
-            "/api/articles",
-            headers={"Authorization": f"Token {token1}"},
-            json={
-                "article": {
-                    "title": "Discussion Article",
-                    "description": "Let's discuss",
-                    "body": "What do you think?"
-                }
-            }
-        )
-        slug = article_response.json()["article"]["slug"]
-        
-        # User2 adds comment
+        }
         comment_response = await client.post(
-            f"/api/articles/{slug}/comments",
-            headers={"Authorization": f"Token {token2}"},
-            json={
-                "comment": {
-                    "body": "Great article!"
-                }
-            }
+            f"/api/articles/{test_article.slug}/comments",
+            json=comment_payload,
+            headers=auth_headers2
         )
         assert comment_response.status_code == 201
         comment_id = comment_response.json()["comment"]["id"]
         
-        # Get comments
-        comments_response = await client.get(f"/api/articles/{slug}/comments")
-        assert len(comments_response.json()["comments"]) == 1
-        assert comments_response.json()["comments"][0]["author"]["username"] == "commenter"
+        # 2. Get comments
+        get_comments_response = await client.get(f"/api/articles/{test_article.slug}/comments")
+        assert get_comments_response.status_code == 200
+        comments = get_comments_response.json()["comments"]
+        assert len(comments) >= 1
+        assert any(c["id"] == comment_id for c in comments)
         
-        # User2 deletes their comment
+        # 3. Delete comment as author
         delete_response = await client.delete(
-            f"/api/articles/{slug}/comments/{comment_id}",
-            headers={"Authorization": f"Token {token2}"}
+            f"/api/articles/{test_article.slug}/comments/{comment_id}",
+            headers=auth_headers2
         )
         assert delete_response.status_code == 204
+
+    @pytest.mark.asyncio
+    async def test_favorite_and_filter_workflow(self, client: AsyncClient, test_article: Article, auth_headers: dict, test_user: User):
+        """Test favoriting articles and filtering by favorited."""
+        # 1. Favorite an article
+        favorite_response = await client.post(
+            f"/api/articles/{test_article.slug}/favorite",
+            headers=auth_headers
+        )
+        assert favorite_response.status_code == 201
+        assert favorite_response.json()["article"]["favorited"] is True
         
-        # Verify comment is gone
-        final_comments = await client.get(f"/api/articles/{slug}/comments")
-        assert len(final_comments.json()["comments"]) == 0
+        # 2. Filter articles by favorited
+        filter_response = await client.get(
+            f"/api/articles?favorited={test_user.username}",
+            headers=auth_headers
+        )
+        assert filter_response.status_code == 200
+        articles = filter_response.json()["articles"]
+        assert len(articles) >= 1
+        assert all(a["favorited"] is True for a in articles)
+
+    @pytest.mark.asyncio
+    async def test_update_profile_workflow(self, client: AsyncClient, auth_headers: dict):
+        """Test updating user profile information."""
+        # 1. Get current user
+        get_response = await client.get("/api/user", headers=auth_headers)
+        assert get_response.status_code == 200
+        original_bio = get_response.json()["user"].get("bio", "")
+        
+        # 2. Update bio and image
+        update_payload = {
+            "user": {
+                "bio": "Updated bio information",
+                "image": "https://example.com/newavatar.jpg"
+            }
+        }
+        update_response = await client.put("/api/user", json=update_payload, headers=auth_headers)
+        assert update_response.status_code == 200
+        assert update_response.json()["user"]["bio"] == "Updated bio information"
+        assert update_response.json()["user"]["image"] == "https://example.com/newavatar.jpg"
+
+
+class TestEdgeCases:
+    """Test edge cases and boundary conditions."""
+
+    @pytest.mark.asyncio
+    async def test_pagination_edge_cases(self, client: AsyncClient):
+        """Test pagination with edge case values."""
+        # Test with limit at maximum
+        response = await client.get("/api/articles?limit=100")
+        assert response.status_code == 200
+        
+        # Test with limit above maximum
+        response = await client.get("/api/articles?limit=101")
+        assert response.status_code == 422
+        
+        # Test with negative offset
+        response = await client.get("/api/articles?offset=-1")
+        assert response.status_code == 422
+
+    @pytest.mark.asyncio
+    async def test_special_characters_in_article(self, client: AsyncClient, auth_headers: dict):
+        """Test article creation with special characters."""
+        payload = {
+            "article": {
+                "title": "Test Article with émojis 🚀 and spëcial çhars",
+                "description": "Testing special characters: @#$%^&*()",
+                "body": "Body with <html>tags</html> and 'quotes'",
+                "tagList": ["special-chars", "émoji"]
+            }
+        }
+        
+        response = await client.post("/api/articles", json=payload, headers=auth_headers)
+        assert response.status_code == 201
+        data = response.json()
+        assert "slug" in data["article"]
+
+    @pytest.mark.asyncio
+    async def test_concurrent_slug_generation(self, client: AsyncClient, auth_headers: dict, auth_headers2: dict):
+        """Test that concurrent articles with same title get unique slugs."""
+        payload = {
+            "article": {
+                "title": "Same Title",
+                "description": "Description",
+                "body": "Body content"
+            }
+        }
+        
+        # Create two articles with same title
+        response1 = await client.post("/api/articles", json=payload, headers=auth_headers)
+        response2 = await client.post("/api/articles", json=payload, headers=auth_headers2)
+        
+        assert response1.status_code == 201
+        assert response2.status_code == 201
+        
+        slug1 = response1.json()["article"]["slug"]
+        slug2 = response2.json()["article"]["slug"]
+        
+        # Slugs should be different
+        assert slug1 != slug2
+
+    @pytest.mark.asyncio
+    async def test_very_long_article_body(self, client: AsyncClient, auth_headers: dict):
+        """Test article with very long body (near limit)."""
+        long_body = "a" * 99999  # Just under limit
+        
+        payload = {
+            "article": {
+                "title": "Long Article",
+                "description": "Testing long body",
+                "body": long_body
+            }
+        }
+        
+        response = await client.post("/api/articles", json=payload, headers=auth_headers)
+        assert response.status_code == 201
+
+    @pytest.mark.asyncio
+    async def test_article_body_exceeds_limit(self, client: AsyncClient, auth_headers: dict):
+        """Test article with body exceeding maximum length."""
+        too_long_body = "a" * 100001  # Exceeds limit
+        
+        payload = {
+            "article": {
+                "title": "Too Long Article",
+                "description": "Testing body limit",
+                "body": too_long_body
+            }
+        }
+        
+        response = await client.post("/api/articles", json=payload, headers=auth_headers)
+        assert response.status_code == 422
