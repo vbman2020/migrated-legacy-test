@@ -1,128 +1,98 @@
-"""Profile API routes.
-
-Provides endpoints for:
-- Retrieving user profiles
-- Following/unfollowing users
-"""
-
-from typing import Optional
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, status
 from sqlalchemy.ext.asyncio import AsyncSession
+from typing import Optional
 
 from app.database import get_db
+from app.auth.dependencies import get_current_user, get_optional_user
 from app.auth.models import User
-from app.auth.service import get_current_user, get_current_user_optional
-from app.profiles.schemas import ProfileResponseWrapper
+from app.profiles.schemas import ProfileResponse
 from app.profiles.service import ProfileService
 
 router = APIRouter(prefix="/api/profiles", tags=["profiles"])
 
 
-@router.get("/{username}", response_model=ProfileResponseWrapper)
+@router.get("/{username}", response_model=ProfileResponse, status_code=status.HTTP_200_OK)
 async def get_profile(
     username: str,
-    current_user: Optional[User] = Depends(get_current_user_optional),
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
+    current_user: Optional[User] = Depends(get_optional_user)
 ):
     """Get a user profile by username.
     
-    This endpoint can be accessed both authenticated and unauthenticated.
-    If authenticated, the 'following' field will indicate whether the current
-    user is following this profile.
+    This endpoint can be accessed by both authenticated and unauthenticated users.
+    If authenticated, the response includes whether the current user is following this profile.
     
     Args:
         username: The username of the profile to retrieve
-        current_user: Optional authenticated user
         db: Database session
-    
+        current_user: Currently authenticated user (optional)
+        
     Returns:
-        ProfileResponseWrapper containing the profile data
-    
+        ProfileResponse containing the user profile
+        
     Raises:
-        HTTPException 404: If profile with username does not exist
+        HTTPException 404: If profile not found
     """
-    profile_service = ProfileService(db)
-    profile = await profile_service.get_profile_by_username(username, current_user)
-    
-    if not profile:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="A profile with this username does not exist."
-        )
-    
-    return ProfileResponseWrapper(profile=profile)
+    profile = await ProfileService.get_profile_by_username(db, username, current_user)
+    return ProfileResponse(profile=profile)
 
 
-@router.post("/{username}/follow", response_model=ProfileResponseWrapper, status_code=status.HTTP_200_OK)
+@router.post(
+    "/{username}/follow",
+    response_model=ProfileResponse,
+    status_code=status.HTTP_201_CREATED
+)
 async def follow_user(
     username: str,
-    current_user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user)
 ):
     """Follow a user.
     
-    Requires authentication. Users cannot follow themselves.
-    Returns HTTP 200 on success (even if already following).
+    Requires authentication. The current user will follow the user specified by username.
     
     Args:
         username: The username of the user to follow
-        current_user: Authenticated user making the request
         db: Database session
-    
+        current_user: Currently authenticated user
+        
     Returns:
-        ProfileResponseWrapper with following=True
-    
+        ProfileResponse of the followed user with following=True
+        
     Raises:
-        HTTPException 404: If user to follow does not exist
-        HTTPException 422: If trying to follow yourself
+        HTTPException 401: If not authenticated
+        HTTPException 404: If profile not found
+        HTTPException 422: If user tries to follow themselves
     """
-    if current_user.username == username:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="You can not follow yourself."
-        )
-    
-    profile_service = ProfileService(db)
-    profile = await profile_service.follow_user(current_user, username)
-    
-    if not profile:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="A profile with this username was not found."
-        )
-    
-    return ProfileResponseWrapper(profile=profile)
+    profile = await ProfileService.follow_user(db, username, current_user)
+    return ProfileResponse(profile=profile)
 
 
-@router.delete("/{username}/follow", response_model=ProfileResponseWrapper)
+@router.delete(
+    "/{username}/follow",
+    response_model=ProfileResponse,
+    status_code=status.HTTP_200_OK
+)
 async def unfollow_user(
     username: str,
-    current_user: User = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user)
 ):
     """Unfollow a user.
     
-    Requires authentication.
-    Returns HTTP 200 on success (even if not currently following).
+    Requires authentication. The current user will unfollow the user specified by username.
     
     Args:
         username: The username of the user to unfollow
-        current_user: Authenticated user making the request
         db: Database session
-    
+        current_user: Currently authenticated user
+        
     Returns:
-        ProfileResponseWrapper with following=False
-    
+        ProfileResponse of the unfollowed user with following=False
+        
     Raises:
-        HTTPException 404: If user to unfollow does not exist
+        HTTPException 401: If not authenticated
+        HTTPException 404: If profile not found
     """
-    profile_service = ProfileService(db)
-    profile = await profile_service.unfollow_user(current_user, username)
-    
-    if not profile:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="A profile with this username was not found."
-        )
-    
-    return ProfileResponseWrapper(profile=profile)
+    profile = await ProfileService.unfollow_user(db, username, current_user)
+    return ProfileResponse(profile=profile)
