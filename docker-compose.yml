@@ -1,84 +1,113 @@
 version: '3.8'
 
 services:
-  # PostgreSQL Database
-  postgres:
+  # PostgreSQL database
+  db:
     image: postgres:16-alpine
-    container_name: conduit-postgres
+    container_name: conduit_db
+    restart: unless-stopped
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-conduit}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-conduit_password}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-conduit_dev_password}
       POSTGRES_DB: ${POSTGRES_DB:-conduit}
     ports:
-      - "5432:5432"
+      - "${POSTGRES_PORT:-5432}:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U conduit"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-conduit}"]
       interval: 10s
       timeout: 5s
       retries: 5
     networks:
-      - conduit-network
+      - conduit_network
 
-  # Redis Cache
+  # Redis cache
   redis:
     image: redis:7-alpine
-    container_name: conduit-redis
+    container_name: conduit_redis
+    restart: unless-stopped
+    command: redis-server --appendonly yes
     ports:
-      - "6379:6379"
+      - "${REDIS_PORT:-6379}:6379"
     volumes:
       - redis_data:/data
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 10s
-      timeout: 3s
+      timeout: 5s
       retries: 5
     networks:
-      - conduit-network
-    command: redis-server --appendonly yes
+      - conduit_network
 
-  # FastAPI Application
+  # FastAPI application
   app:
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: conduit-app
+    container_name: conduit_app
+    restart: unless-stopped
+    ports:
+      - "${APP_PORT:-8000}:8000"
     environment:
-      # Database
-      DATABASE_URL: postgresql://${POSTGRES_USER:-conduit}:${POSTGRES_PASSWORD:-conduit_password}@postgres:5432/${POSTGRES_DB:-conduit}
-      # Redis
+      # Application settings
+      APP_NAME: ${APP_NAME:-Conduit}
+      DEBUG: ${DEBUG:-false}
+      ENVIRONMENT: ${ENVIRONMENT:-development}
+      
+      # Database configuration
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-conduit}:${POSTGRES_PASSWORD:-conduit_dev_password}@db:5432/${POSTGRES_DB:-conduit}
+      
+      # Redis configuration
       REDIS_URL: redis://redis:6379/0
-      # JWT
-      SECRET_KEY: ${SECRET_KEY:-dev-secret-key-change-in-production}
+      
+      # JWT settings
+      SECRET_KEY: ${SECRET_KEY:-your-secret-key-change-in-production}
       ALGORITHM: ${ALGORITHM:-HS256}
       ACCESS_TOKEN_EXPIRE_MINUTES: ${ACCESS_TOKEN_EXPIRE_MINUTES:-30}
-      # Application
-      ENVIRONMENT: ${ENVIRONMENT:-development}
-      DEBUG: ${DEBUG:-true}
-      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:3000,http://localhost:8000}
-    ports:
-      - "8000:8000"
+      
+      # CORS settings
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-http://localhost:3000,http://localhost:8080}
     depends_on:
-      postgres:
+      db:
         condition: service_healthy
       redis:
         condition: service_healthy
     volumes:
       - ./app:/app/app
       - ./alembic:/app/alembic
-      - ./tests:/app/tests
-    networks:
-      - conduit-network
+      - ./alembic.ini:/app/alembic.ini
     command: >
       sh -c "
-        echo 'Waiting for database to be ready...'
+        echo 'Waiting for database...'
         sleep 5
-        echo 'Running database migrations...'
+        echo 'Running migrations...'
         alembic upgrade head
         echo 'Starting application...'
         uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
       "
+    networks:
+      - conduit_network
+
+  # Database migration service (one-time)
+  migrate:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: conduit_migrate
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-conduit}:${POSTGRES_PASSWORD:-conduit_dev_password}@db:5432/${POSTGRES_DB:-conduit}
+    depends_on:
+      db:
+        condition: service_healthy
+    volumes:
+      - ./alembic:/app/alembic
+      - ./alembic.ini:/app/alembic.ini
+    command: alembic upgrade head
+    networks:
+      - conduit_network
+    profiles:
+      - migration
 
 volumes:
   postgres_data:
@@ -87,5 +116,5 @@ volumes:
     driver: local
 
 networks:
-  conduit-network:
+  conduit_network:
     driver: bridge
