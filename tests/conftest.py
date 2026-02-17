@@ -1,40 +1,26 @@
-"""Shared pytest fixtures for all tests.
-
-Provides database session, test client, and authentication helpers.
-"""
-
+"""Pytest configuration and shared fixtures."""
 import asyncio
+import os
 from typing import AsyncGenerator, Generator
 
 import pytest
 import pytest_asyncio
+from fastapi import FastAPI
 from httpx import AsyncClient
+from sqlalchemy import event, create_engine
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sessionmaker
-from sqlalchemy.pool import NullPool
+from sqlalchemy.orm import sessionmaker, Session
+from sqlalchemy.pool import StaticPool
 
 from app.database import Base, get_db
-from app.main import app
+from app.main import app as main_app
 from app.auth.models import User
 from app.auth.service import AuthService
+from app.profiles.models import Profile
+
 
 # Use in-memory SQLite for tests
 TEST_DATABASE_URL = "sqlite+aiosqlite:///:memory:"
-
-# Create async engine for tests
-test_engine = create_async_engine(
-    TEST_DATABASE_URL,
-    echo=False,
-    poolclass=NullPool,
-)
-
-# Create async session factory
-TestSessionLocal = async_sessionmaker(
-    test_engine,
-    class_=AsyncSession,
-    expire_on_commit=False,
-    autoflush=False,
-    autocommit=False,
-)
 
 
 @pytest.fixture(scope="session")
@@ -46,139 +32,111 @@ def event_loop() -> Generator:
 
 
 @pytest_asyncio.fixture
-async def db_session() -> AsyncGenerator[AsyncSession, None]:
-    """Create a fresh database session for each test.
+async def db_engine():
+    """Create a test database engine."""
+    engine = create_async_engine(
+        TEST_DATABASE_URL,
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
     
-    Creates all tables before the test and drops them after.
-    """
-    # Create tables
-    async with test_engine.begin() as conn:
+    async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
     
-    # Create session
-    async with TestSessionLocal() as session:
+    yield engine
+    
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.drop_all)
+    
+    await engine.dispose()
+
+
+@pytest_asyncio.fixture
+async def db_session(db_engine) -> AsyncGenerator[AsyncSession, None]:
+    """Create a test database session."""
+    async_session_maker = async_sessionmaker(
+        db_engine,
+        class_=AsyncSession,
+        expire_on_commit=False,
+    )
+    
+    async with async_session_maker() as session:
         yield session
         await session.rollback()
-    
-    # Drop tables
-    async with test_engine.begin() as conn:
-        await conn.run_sync(Base.metadata.drop_all)
 
 
 @pytest_asyncio.fixture
 async def client(db_session: AsyncSession) -> AsyncGenerator[AsyncClient, None]:
-    """Create test client with database session override."""
+    """Create a test client with overridden database session."""
     
     async def override_get_db() -> AsyncGenerator[AsyncSession, None]:
         yield db_session
     
-    app.dependency_overrides[get_db] = override_get_db
+    main_app.dependency_overrides[get_db] = override_get_db
     
-    async with AsyncClient(app=app, base_url="http://test") as ac:
+    async with AsyncClient(app=main_app, base_url="http://test") as ac:
         yield ac
     
-    app.dependency_overrides.clear()
+    main_app.dependency_overrides.clear()
 
 
 @pytest_asyncio.fixture
 async def test_user(db_session: AsyncSession) -> User:
     """Create a test user."""
-    auth_service = AuthService(db_session)
-    user = await auth_service.create_user(
-        email="test@example.com",
+    user = await AuthService.create_user(
+        db=db_session,
         username="testuser",
-        password="TestPass123!",
+        email="test@example.com",
+        password="password123"
     )
+    
+    # Create profile for user
+    profile = Profile(user_id=user.id, bio="Test bio", image="")
+    db_session.add(profile)
     await db_session.commit()
     await db_session.refresh(user)
+    
     return user
 
 
 @pytest_asyncio.fixture
 async def test_user2(db_session: AsyncSession) -> User:
     """Create a second test user."""
-    auth_service = AuthService(db_session)
-    user = await auth_service.create_user(
-        email="test2@example.com",
+    user = await AuthService.create_user(
+        db=db_session,
         username="testuser2",
-        password="TestPass123!",
+        email="test2@example.com",
+        password="password123"
     )
+    
+    # Create profile for user
+    profile = Profile(user_id=user.id, bio="Test bio 2", image="")
+    db_session.add(profile)
     await db_session.commit()
     await db_session.refresh(user)
+    
     return user
 
 
 @pytest_asyncio.fixture
-async def auth_token(test_user: User, db_session: AsyncSession) -> str:
+async def auth_token(test_user: User) -> str:
     """Get authentication token for test user."""
-    auth_service = AuthService(db_session)
-    token = auth_service.create_access_token(user_id=test_user.id)
-    return token
-
-
-@pytest_asyncio.fixture
-async def auth_token2(test_user2: User, db_session: AsyncSession) -> str:
-    """Get authentication token for second test user."""
-    auth_service = AuthService(db_session)
-    token = auth_service.create_access_token(user_id=test_user2.id)
-    return token
+    return AuthService.create_access_token(test_user.id)
 
 
 @pytest_asyncio.fixture
 async def auth_headers(auth_token: str) -> dict:
-    """Get authorization headers for test user."""
+    """Get authentication headers for test user."""
     return {"Authorization": f"Token {auth_token}"}
 
 
 @pytest_asyncio.fixture
+async def auth_token2(test_user2: User) -> str:
+    """Get authentication token for second test user."""
+    return AuthService.create_access_token(test_user2.id)
+
+
+@pytest_asyncio.fixture
 async def auth_headers2(auth_token2: str) -> dict:
-    """Get authorization headers for second test user."""
+    """Get authentication headers for second test user."""
     return {"Authorization": f"Token {auth_token2}"}
-
-
-# Sample data fixtures
-@pytest.fixture
-def sample_user_data() -> dict:
-    """Sample user registration data."""
-    return {
-        "user": {
-            "email": "jake@jake.jake",
-            "username": "jakejake",
-            "password": "JakePass123!",
-        }
-    }
-
-
-@pytest.fixture
-def sample_article_data() -> dict:
-    """Sample article creation data."""
-    return {
-        "article": {
-            "title": "How to train your dragon",
-            "description": "Ever wonder how?",
-            "body": "You have to believe",
-            "tagList": ["dragons", "training"],
-        }
-    }
-
-
-@pytest.fixture
-def sample_comment_data() -> dict:
-    """Sample comment creation data."""
-    return {
-        "comment": {
-            "body": "This is a great article!",
-        }
-    }
-
-
-@pytest.fixture
-def sample_profile_update() -> dict:
-    """Sample profile update data."""
-    return {
-        "user": {
-            "email": "newemail@example.com",
-            "bio": "I like to code",
-            "image": "https://example.com/avatar.jpg",
-        }
-    }
