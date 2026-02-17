@@ -1,33 +1,21 @@
-"""Profile Pydantic schemas.
-
-Defines the response schemas for profile endpoints following the RealWorld API spec.
-"""
-
 from pydantic import BaseModel, ConfigDict, Field
+from typing import Optional
 
 
-class ProfileResponse(BaseModel):
-    """Profile response schema matching RealWorld API spec.
+class ProfileSchema(BaseModel):
+    """Profile schema for API responses."""
     
-    Attributes:
-        username: The user's unique username
-        bio: User's biography (empty string if not set)
-        image: URL to user's profile image (default placeholder if not set)
-        following: Whether the current user is following this profile
-    """
-    username: str
-    bio: str = ""
-    image: str = "https://static.productionready.io/images/smiley-cyrus.jpg"
-    following: bool = False
+    username: str = Field(..., description="Username of the profile")
+    bio: str = Field(default="", description="User biography")
+    image: str = Field(default="", description="Profile image URL")
+    following: bool = Field(default=False, description="Whether current user is following this profile")
 
     model_config = ConfigDict(from_attributes=True)
 
 
-class ProfileResponseWrapper(BaseModel):
-    """Wrapper for profile response to match RealWorld API spec.
+class ProfileResponse(BaseModel):
+    """Wrapper for profile response matching RealWorld API spec."""
     
-    The RealWorld API wraps profile responses in a 'profile' key.
-    """
-    profile: ProfileResponse
+    profile: ProfileSchema
 
     model_config = ConfigDict(from_attributes=True)
