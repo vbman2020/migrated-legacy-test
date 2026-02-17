@@ -1,14 +1,5 @@
-# Git
-.git
-.gitignore
-.gitattributes
-
-# CI/CD
-.github
-.gitlab-ci.yml
-
 # Python
-__pycache__
+__pycache__/
 *.py[cod]
 *$py.class
 *.so
@@ -25,8 +16,6 @@ parts/
 sdist/
 var/
 wheels/
-pip-wheel-metadata/
-share/python-wheels/
 *.egg-info/
 .installed.cfg
 *.egg
@@ -34,24 +23,11 @@ PIPFILE.lock
 
 # Virtual environments
 venv/
-.venv/
-ENV/
 env/
-.env
-.venv
+ENV/
+.venv/
 
-# Testing
-.pytest_cache/
-.coverage
-.coverage.*
-htmlcov/
-.tox/
-.nox/
-coverage.xml
-*.cover
-.hypothesis/
-
-# IDEs
+# IDE
 .vscode/
 .idea/
 *.swp
@@ -59,15 +35,39 @@ coverage.xml
 *~
 .DS_Store
 
-# Documentation
-docs/
-*.md
-LICENSE
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.mypy_cache/
+.ruff_cache/
+coverage.xml
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Git
+.git/
+.gitignore
+.gitattributes
 
 # Docker
-Docker*
+Dockerfile
 docker-compose*.yml
 .dockerignore
+
+# Documentation
+README.md
+DOCS.md
+docs/
+
+# CI/CD
+.github/
+.gitlab-ci.yml
+.travis.yml
 
 # Logs
 *.log
@@ -78,11 +78,6 @@ logs/
 *.sqlite
 *.sqlite3
 
-# Environment
-.env.local
-.env.*.local
-
-# Misc
-.cache/
-tmp/
-temp/
+# Other
+.pre-commit-config.yaml
+Makefile
