@@ -1,152 +1,125 @@
-"""Authentication dependencies for FastAPI dependency injection.
-
-Provides reusable dependencies for extracting and validating
-the current user from JWT tokens in the Authorization header.
-"""
-
-from typing import Optional
+"""FastAPI dependencies for authentication."""
 import logging
+from typing import Optional
 
-import jwt
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.auth.service import auth_service
 from app.database import get_db
-from app.auth.models import User
-from app.auth.service import AuthService
 
-# Configure logging
+
 logger = logging.getLogger(__name__)
 
-# HTTP Bearer token authentication scheme
-# auto_error=False allows optional authentication
+# HTTP Bearer token security scheme
 security = HTTPBearer(auto_error=False)
 
 
 async def get_current_user(
     db: AsyncSession = Depends(get_db),
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)
-) -> User:
-    """Dependency to get the current authenticated user.
+):
+    """Get the current authenticated user.
     
-    Validates the JWT token from the Authorization header and returns the user.
-    Raises HTTPException if authentication fails.
+    This dependency extracts and validates the JWT token from the Authorization header,
+    and returns the authenticated user object. Required for protected endpoints.
     
     Args:
-        db: Database session (injected)
-        credentials: HTTP authorization credentials (injected)
-        
+        db: Database session from dependency.
+        credentials: HTTP Bearer credentials from Authorization header.
+    
     Returns:
-        Authenticated user with profile loaded
-        
+        User: The authenticated user object.
+    
     Raises:
-        HTTPException 401: If no credentials, invalid token, expired token, or user not found
-        HTTPException 403: If user account is deactivated
-        
-    Usage:
-        @router.get("/protected")
-        async def protected_route(current_user: User = Depends(get_current_user)):
-            return {"user": current_user.username}
+        HTTPException: 401 if not authenticated or token invalid.
+        HTTPException: 403 if user account is inactive.
     """
-    if not credentials:
-        logger.warning("Request made without authentication credentials")
+    if credentials is None:
+        logger.debug("No credentials provided")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Authentication credentials were not provided.",
+            detail="Not authenticated",
             headers={"WWW-Authenticate": "Bearer"},
         )
     
     token = credentials.credentials
+    token_data = auth_service.decode_access_token(token)
     
+    if token_data is None:
+        logger.warning("Invalid token provided")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Could not validate credentials",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    
+    # Convert token subject (user_id as string) to int
     try:
-        payload = AuthService.decode_jwt_token(token)
-        user_id: int = payload.get("id")
-        if user_id is None:
-            logger.warning("JWT token missing 'id' field")
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Invalid authentication token.",
-                headers={"WWW-Authenticate": "Bearer"},
-            )
-    except jwt.ExpiredSignatureError:
-        logger.warning("Expired JWT token used")
+        user_id = int(token_data.sub)
+    except (ValueError, TypeError):
+        logger.error(f"Invalid token subject: {token_data.sub}")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Authentication token has expired.",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-    except jwt.InvalidTokenError as e:
-        logger.warning(f"Invalid JWT token: {str(e)}")
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid authentication token.",
+            detail="Invalid token payload",
             headers={"WWW-Authenticate": "Bearer"},
         )
     
-    user = await AuthService.get_user_by_id(db, user_id)
+    user = await auth_service.get_user_by_id(db, user_id)
     
     if user is None:
-        logger.warning(f"JWT token references non-existent user ID: {user_id}")
+        logger.warning(f"User not found for token: {user_id}")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="User not found.",
+            detail="User not found",
             headers={"WWW-Authenticate": "Bearer"},
         )
     
     if not user.is_active:
-        logger.warning(f"Deactivated user attempted access: {user.username} (ID: {user.id})")
+        logger.warning(f"Inactive user attempted access: {user.email}")
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="This user has been deactivated."
+            detail="Inactive user"
         )
     
     return user
 
 
-async def get_current_user_optional(
+async def get_optional_user(
     db: AsyncSession = Depends(get_db),
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)
-) -> Optional[User]:
-    """Dependency to optionally get the current authenticated user.
+):
+    """Get the current user if authenticated, None otherwise.
     
-    Returns the user if a valid token is provided, otherwise returns None.
-    Does not raise an exception if no credentials are provided or if they're invalid.
-    Useful for endpoints that behave differently for authenticated vs anonymous users.
+    This dependency is used for endpoints that can work with or without authentication,
+    such as viewing articles (where favorited/following status depends on auth).
+    Does not raise exceptions for missing or invalid tokens.
     
     Args:
-        db: Database session (injected)
-        credentials: HTTP authorization credentials (injected)
-        
+        db: Database session from dependency.
+        credentials: HTTP Bearer credentials from Authorization header.
+    
     Returns:
-        Authenticated user with profile loaded if valid token provided, None otherwise
-        
-    Note:
-        - Returns None for missing, expired, or invalid tokens
-        - Returns None for deactivated users
-        - Does not raise exceptions (silent failure)
-        
-    Usage:
-        @router.get("/optional-auth")
-        async def optional_route(current_user: Optional[User] = Depends(get_current_user_optional)):
-            if current_user:
-                return {"message": f"Hello {current_user.username}"}
-            return {"message": "Hello anonymous"}
+        Optional[User]: User object if authenticated and valid, None otherwise.
     """
-    if not credentials:
+    if credentials is None:
         return None
     
     token = credentials.credentials
+    token_data = auth_service.decode_access_token(token)
     
-    try:
-        payload = AuthService.decode_jwt_token(token)
-        user_id: int = payload.get("id")
-        if user_id is None:
-            return None
-    except (jwt.ExpiredSignatureError, jwt.InvalidTokenError):
+    if token_data is None:
         return None
     
-    user = await AuthService.get_user_by_id(db, user_id)
+    # Convert token subject (user_id as string) to int
+    try:
+        user_id = int(token_data.sub)
+    except (ValueError, TypeError):
+        logger.debug(f"Invalid token subject in optional auth: {token_data.sub}")
+        return None
+    
+    user = await auth_service.get_user_by_id(db, user_id)
     
     if user is None or not user.is_active:
         return None
