@@ -1,255 +1,236 @@
-from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import selectinload
-from typing import Optional
+"""Profile business logic and database operations.
 
-from app.profiles.models import Profile
-from app.profiles.schemas import ProfileBase
+Provides services for:
+- Retrieving user profiles
+- Managing follow relationships
+- Checking follow status
+"""
+
+from typing import Optional
+from sqlalchemy import select, and_, exists
+from sqlalchemy.ext.asyncio import AsyncSession
+
 from app.auth.models import User
-from app.articles.models import Article
+from app.profiles.models import follower_association
+from app.profiles.schemas import ProfileResponse
 
 
 class ProfileService:
-    """Service for profile operations including follow/unfollow and favorites."""
-
-    DEFAULT_PROFILE_IMAGE = "https://static.productionready.io/images/smiley-cyrus.jpg"
-
+    """Service class for profile-related operations.
+    
+    Handles all business logic related to user profiles and follow relationships.
+    """
+    
     def __init__(self, db: AsyncSession):
         """Initialize the profile service.
         
         Args:
-            db: Database session
+            db: Async database session
         """
         self.db = db
-
+    
     async def get_profile_by_username(
         self,
         username: str,
-        current_user: Optional[User] = None,
-    ) -> Optional[ProfileBase]:
-        """Get a profile by username.
+        current_user: Optional[User] = None
+    ) -> Optional[ProfileResponse]:
+        """Retrieve a user profile by username.
         
         Args:
-            username: Username to look up
-            current_user: Currently authenticated user (optional)
+            username: The username to look up
+            current_user: The currently authenticated user (optional)
         
         Returns:
-            ProfileBase with profile data or None if not found
+            ProfileResponse if found, None otherwise
         """
-        # Query for the profile with the user relationship
-        stmt = (
-            select(Profile)
-            .join(Profile.user)
-            .where(User.username == username)
-            .options(selectinload(Profile.user))
-            .options(selectinload(Profile.follows))
-        )
+        # Query for the user by username
+        stmt = select(User).where(User.username == username)
         result = await self.db.execute(stmt)
-        profile = result.scalar_one_or_none()
-
-        if not profile:
+        user = result.scalar_one_or_none()
+        
+        if not user:
             return None
-
+        
         # Check if current user is following this profile
         following = False
-        if current_user and current_user.profile:
-            following = await self._is_following(
-                follower_profile=current_user.profile,
-                followee_profile=profile,
-            )
-
-        return self._profile_to_schema(profile, following)
-
+        if current_user:
+            following = await self.is_following(current_user.id, user.id)
+        
+        return ProfileResponse(
+            username=user.username,
+            bio=user.bio or "",
+            image=user.image or "https://static.productionready.io/images/smiley-cyrus.jpg",
+            following=following
+        )
+    
     async def follow_user(
         self,
         follower: User,
-        username_to_follow: str,
-    ) -> Optional[ProfileBase]:
-        """Follow a user by username.
+        followee_username: str
+    ) -> Optional[ProfileResponse]:
+        """Make the follower follow the user with the given username.
+        
+        This operation is idempotent - following an already-followed user
+        will succeed without error.
         
         Args:
-            follower: User who is following
-            username_to_follow: Username of user to follow
+            follower: The user who is following
+            followee_username: Username of the user to follow
         
         Returns:
-            ProfileBase with updated profile data or None if not found
+            ProfileResponse of the followed user if found, None otherwise
         """
-        # Get the profile to follow
-        stmt = (
-            select(Profile)
-            .join(Profile.user)
-            .where(User.username == username_to_follow)
-            .options(selectinload(Profile.user))
-            .options(selectinload(Profile.follows))
-        )
+        # Get the user to follow
+        stmt = select(User).where(User.username == followee_username)
         result = await self.db.execute(stmt)
-        followee_profile = result.scalar_one_or_none()
-
-        if not followee_profile:
+        followee = result.scalar_one_or_none()
+        
+        if not followee:
             return None
-
-        # Get the follower's profile with follows loaded
-        stmt = (
-            select(Profile)
-            .where(Profile.id == follower.profile.id)
-            .options(selectinload(Profile.follows))
-        )
-        result = await self.db.execute(stmt)
-        follower_profile = result.scalar_one_or_none()
-
-        if not follower_profile:
-            return None
-
-        # Add the follow relationship if not already following
-        if followee_profile not in follower_profile.follows:
-            follower_profile.follows.append(followee_profile)
+        
+        # Check if already following
+        already_following = await self.is_following(follower.id, followee.id)
+        
+        if not already_following:
+            # Add the follow relationship
+            stmt = follower_association.insert().values(
+                follower_id=follower.id,
+                followed_id=followee.id
+            )
+            await self.db.execute(stmt)
             await self.db.commit()
-            await self.db.refresh(followee_profile)
-
-        return self._profile_to_schema(followee_profile, following=True)
-
+        
+        return ProfileResponse(
+            username=followee.username,
+            bio=followee.bio or "",
+            image=followee.image or "https://static.productionready.io/images/smiley-cyrus.jpg",
+            following=True
+        )
+    
     async def unfollow_user(
         self,
         follower: User,
-        username_to_unfollow: str,
-    ) -> Optional[ProfileBase]:
-        """Unfollow a user by username.
+        followee_username: str
+    ) -> Optional[ProfileResponse]:
+        """Make the follower unfollow the user with the given username.
+        
+        This operation is idempotent - unfollowing a non-followed user
+        will succeed without error.
         
         Args:
-            follower: User who is unfollowing
-            username_to_unfollow: Username of user to unfollow
+            follower: The user who is unfollowing
+            followee_username: Username of the user to unfollow
         
         Returns:
-            ProfileBase with updated profile data or None if not found
+            ProfileResponse of the unfollowed user if found, None otherwise
         """
-        # Get the profile to unfollow
-        stmt = (
-            select(Profile)
-            .join(Profile.user)
-            .where(User.username == username_to_unfollow)
-            .options(selectinload(Profile.user))
-            .options(selectinload(Profile.follows))
-        )
+        # Get the user to unfollow
+        stmt = select(User).where(User.username == followee_username)
         result = await self.db.execute(stmt)
-        followee_profile = result.scalar_one_or_none()
-
-        if not followee_profile:
+        followee = result.scalar_one_or_none()
+        
+        if not followee:
             return None
-
-        # Get the follower's profile with follows loaded
-        stmt = (
-            select(Profile)
-            .where(Profile.id == follower.profile.id)
-            .options(selectinload(Profile.follows))
+        
+        # Remove the follow relationship if it exists
+        stmt = follower_association.delete().where(
+            and_(
+                follower_association.c.follower_id == follower.id,
+                follower_association.c.followed_id == followee.id
+            )
         )
-        result = await self.db.execute(stmt)
-        follower_profile = result.scalar_one_or_none()
-
-        if not follower_profile:
-            return None
-
-        # Remove the follow relationship if currently following
-        if followee_profile in follower_profile.follows:
-            follower_profile.follows.remove(followee_profile)
-            await self.db.commit()
-            await self.db.refresh(followee_profile)
-
-        return self._profile_to_schema(followee_profile, following=False)
-
-    async def _is_following(
-        self,
-        follower_profile: Profile,
-        followee_profile: Profile,
-    ) -> bool:
-        """Check if follower is following followee.
+        await self.db.execute(stmt)
+        await self.db.commit()
+        
+        return ProfileResponse(
+            username=followee.username,
+            bio=followee.bio or "",
+            image=followee.image or "https://static.productionready.io/images/smiley-cyrus.jpg",
+            following=False
+        )
+    
+    async def is_following(self, follower_id: int, followed_id: int) -> bool:
+        """Check if follower_id is following followed_id.
         
         Args:
-            follower_profile: Profile of the follower
-            followee_profile: Profile being followed
+            follower_id: ID of the potential follower
+            followed_id: ID of the potentially followed user
         
         Returns:
             True if following, False otherwise
         """
-        # Refresh the follower profile to get the latest follows
-        await self.db.refresh(follower_profile, attribute_names=["follows"])
-        return followee_profile in follower_profile.follows
-
-    async def is_favorited_by(
-        self,
-        profile: Profile,
-        article: Article,
-    ) -> bool:
-        """Check if a profile has favorited an article.
+        stmt = select(exists().where(
+            and_(
+                follower_association.c.follower_id == follower_id,
+                follower_association.c.followed_id == followed_id
+            )
+        ))
+        result = await self.db.execute(stmt)
+        return result.scalar() or False
+    
+    async def is_followed_by(self, user_id: int, follower_id: int) -> bool:
+        """Check if user_id is followed by follower_id.
+        
+        This is the inverse of is_following.
         
         Args:
-            profile: Profile to check
-            article: Article to check
+            user_id: ID of the user
+            follower_id: ID of the potential follower
         
         Returns:
-            True if favorited, False otherwise
+            True if followed by, False otherwise
         """
-        await self.db.refresh(profile, attribute_names=["favorites"])
-        return article in profile.favorites
-
-    async def favorite_article(
-        self,
-        profile: Profile,
-        article: Article,
-    ) -> None:
-        """Add an article to user's favorites.
+        return await self.is_following(follower_id, user_id)
+    
+    async def get_followers(self, user_id: int) -> list[User]:
+        """Get all users following the given user.
         
         Args:
-            profile: Profile favoriting the article
-            article: Article to favorite
-        """
-        # Refresh to get current favorites
-        await self.db.refresh(profile, attribute_names=["favorites"])
-        
-        if article not in profile.favorites:
-            profile.favorites.append(article)
-            await self.db.commit()
-            await self.db.refresh(profile)
-            await self.db.refresh(article)
-
-    async def unfavorite_article(
-        self,
-        profile: Profile,
-        article: Article,
-    ) -> None:
-        """Remove an article from user's favorites.
-        
-        Args:
-            profile: Profile unfavoriting the article
-            article: Article to unfavorite
-        """
-        # Refresh to get current favorites
-        await self.db.refresh(profile, attribute_names=["favorites"])
-        
-        if article in profile.favorites:
-            profile.favorites.remove(article)
-            await self.db.commit()
-            await self.db.refresh(profile)
-            await self.db.refresh(article)
-
-    def _profile_to_schema(
-        self,
-        profile: Profile,
-        following: bool = False,
-    ) -> ProfileBase:
-        """Convert a Profile model to ProfileBase schema.
-        
-        Args:
-            profile: Profile model
-            following: Whether current user is following this profile
+            user_id: ID of the user
         
         Returns:
-            ProfileBase schema
+            List of User objects who are following this user
         """
-        image = profile.image if profile.image else self.DEFAULT_PROFILE_IMAGE
-        
-        return ProfileBase(
-            username=profile.user.username,
-            bio=profile.bio,
-            image=image,
-            following=following,
+        stmt = (
+            select(User)
+            .join(follower_association, User.id == follower_association.c.follower_id)
+            .where(follower_association.c.followed_id == user_id)
         )
+        result = await self.db.execute(stmt)
+        return list(result.scalars().all())
+    
+    async def get_following(self, user_id: int) -> list[User]:
+        """Get all users that the given user is following.
+        
+        Args:
+            user_id: ID of the user
+        
+        Returns:
+            List of User objects that this user is following
+        """
+        stmt = (
+            select(User)
+            .join(follower_association, User.id == follower_association.c.followed_id)
+            .where(follower_association.c.follower_id == user_id)
+        )
+        result = await self.db.execute(stmt)
+        return list(result.scalars().all())
+    
+    async def get_following_ids(self, user_id: int) -> list[int]:
+        """Get IDs of all users that the given user is following.
+        
+        Useful for feed generation and other queries that need to check
+        if content is from followed users.
+        
+        Args:
+            user_id: ID of the user
+        
+        Returns:
+            List of user IDs that this user is following
+        """
+        stmt = (
+            select(follower_association.c.followed_id)
+            .where(follower_association.c.follower_id == user_id)
+        )
+        result = await self.db.execute(stmt)
+        return list(result.scalars().all())
