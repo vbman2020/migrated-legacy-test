@@ -1,188 +1,136 @@
-"""Pydantic schemas for articles, comments, and tags."""
 from datetime import datetime
 from typing import List, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from app.profiles.schemas import ProfileResponse
+# Maximum lengths for validation
+MAX_ARTICLE_BODY_LENGTH = 500000  # 500KB text limit
+MAX_COMMENT_BODY_LENGTH = 50000   # 50KB text limit
+MAX_TAG_LENGTH = 255
+MAX_TITLE_LENGTH = 255
+MAX_DESCRIPTION_LENGTH = 5000
+MAX_TAGS_PER_ARTICLE = 20  # Reduced from 50 to prevent resource exhaustion
 
 
-class TagSchema(BaseModel):
-    """Tag schema."""
-
-    tag: str
+class ProfileSchema(BaseModel):
+    """Embedded profile schema for article/comment author."""
+    username: str
+    bio: Optional[str] = None
+    image: Optional[str] = None
+    following: bool = False
 
     model_config = ConfigDict(from_attributes=True)
 
 
-class TagListResponse(BaseModel):
-    """Response schema for tag list."""
-
-    tags: List[str]
-
-
 class ArticleBase(BaseModel):
-    """Base article schema with common fields."""
-
-    title: str = Field(..., min_length=1, max_length=255)
-    description: str = Field(..., min_length=1)
-    body: str = Field(..., min_length=1, max_length=100000)
-
-    @field_validator('title', 'description', 'body')
-    @classmethod
-    def validate_not_empty(cls, v: str) -> str:
-        """Validate that strings are not empty or just whitespace."""
-        if not v or not v.strip():
-            raise ValueError('Field cannot be empty or whitespace only')
-        return v.strip()
+    title: str = Field(..., max_length=MAX_TITLE_LENGTH)
+    description: str = Field(..., max_length=MAX_DESCRIPTION_LENGTH)
+    body: str = Field(..., max_length=MAX_ARTICLE_BODY_LENGTH)
 
 
 class ArticleCreate(ArticleBase):
-    """Schema for creating an article."""
-
     tagList: Optional[List[str]] = Field(default_factory=list)
 
     @field_validator('tagList')
     @classmethod
-    def validate_tags(cls, v: Optional[List[str]]) -> List[str]:
-        """Validate and sanitize tags."""
-        if not v:
-            return []
-        # Remove empty strings and duplicates, strip whitespace
-        sanitized = []
-        seen = set()
-        for tag in v:
-            if tag and isinstance(tag, str):
-                cleaned = tag.strip()[:255]  # Limit tag length
-                if cleaned and cleaned.lower() not in seen:
-                    sanitized.append(cleaned)
-                    seen.add(cleaned.lower())
-        return sanitized
-
-
-class ArticleUpdate(BaseModel):
-    """Schema for updating an article."""
-
-    title: Optional[str] = Field(None, min_length=1, max_length=255)
-    description: Optional[str] = Field(None, min_length=1)
-    body: Optional[str] = Field(None, min_length=1, max_length=100000)
-    tagList: Optional[List[str]] = None
-
-    @field_validator('title', 'description', 'body')
-    @classmethod
-    def validate_not_empty(cls, v: Optional[str]) -> Optional[str]:
-        """Validate that strings are not empty or just whitespace."""
-        if v is not None:
-            if not v.strip():
-                raise ValueError('Field cannot be empty or whitespace only')
-            return v.strip()
-        return v
-
-    @field_validator('tagList')
-    @classmethod
-    def validate_tags(cls, v: Optional[List[str]]) -> Optional[List[str]]:
-        """Validate and sanitize tags."""
+    def validate_tag_list(cls, v: Optional[List[str]]) -> List[str]:
         if v is None:
-            return None
-        # Remove empty strings and duplicates, strip whitespace
-        sanitized = []
-        seen = set()
+            return []
+        
+        # Check maximum number of tags
+        if len(v) > MAX_TAGS_PER_ARTICLE:
+            raise ValueError(f"Maximum {MAX_TAGS_PER_ARTICLE} tags allowed per article")
+        
+        # Filter out empty strings, strip whitespace, and validate length
+        validated_tags = []
+        seen_tags = set()
+        
         for tag in v:
-            if tag and isinstance(tag, str):
-                cleaned = tag.strip()[:255]  # Limit tag length
-                if cleaned and cleaned.lower() not in seen:
-                    sanitized.append(cleaned)
-                    seen.add(cleaned.lower())
-        return sanitized
+            if tag and tag.strip():
+                cleaned_tag = tag.strip()
+                
+                # Prevent duplicates (case-insensitive)
+                if cleaned_tag.lower() in seen_tags:
+                    continue
+                seen_tags.add(cleaned_tag.lower())
+                
+                if len(cleaned_tag) > MAX_TAG_LENGTH:
+                    raise ValueError(f"Tag '{cleaned_tag}' exceeds maximum length of {MAX_TAG_LENGTH}")
+                validated_tags.append(cleaned_tag)
+        
+        return validated_tags
+
+    model_config = ConfigDict(populate_by_name=True)
 
 
-class ArticleResponse(BaseModel):
-    """Response schema for a single article."""
-
-    slug: str
-    title: str
-    description: str
-    body: str
-    tagList: List[str]
-    createdAt: datetime
-    updatedAt: datetime
-    favorited: bool
-    favoritesCount: int
-    author: ProfileResponse
-
-    model_config = ConfigDict(from_attributes=True)
-
-
-class ArticleCreateRequest(BaseModel):
-    """Wrapper for article creation request."""
-
+class ArticleCreateWrapper(BaseModel):
+    """Wrapper for nested article creation."""
     article: ArticleCreate
 
 
-class ArticleUpdateRequest(BaseModel):
-    """Wrapper for article update request."""
+class ArticleUpdate(BaseModel):
+    title: Optional[str] = Field(None, max_length=MAX_TITLE_LENGTH)
+    description: Optional[str] = Field(None, max_length=MAX_DESCRIPTION_LENGTH)
+    body: Optional[str] = Field(None, max_length=MAX_ARTICLE_BODY_LENGTH)
 
+    model_config = ConfigDict(populate_by_name=True)
+
+
+class ArticleUpdateWrapper(BaseModel):
+    """Wrapper for nested article update."""
     article: ArticleUpdate
 
 
-class ArticleResponseWrapper(BaseModel):
-    """Wrapper for single article response."""
+class ArticleResponse(ArticleBase):
+    slug: str
+    tagList: List[str] = Field(default_factory=list)
+    createdAt: datetime
+    updatedAt: datetime
+    favorited: bool = False
+    favoritesCount: int = 0
+    author: ProfileSchema
 
+    model_config = ConfigDict(from_attributes=True, populate_by_name=True)
+
+
+class ArticleResponseWrapper(BaseModel):
     article: ArticleResponse
 
 
 class ArticleListResponse(BaseModel):
-    """Response schema for article list."""
-
     articles: List[ArticleResponse]
     articlesCount: int
 
 
 class CommentBase(BaseModel):
-    """Base comment schema."""
-
-    body: str = Field(..., min_length=1, max_length=10000)
-
-    @field_validator('body')
-    @classmethod
-    def validate_not_empty(cls, v: str) -> str:
-        """Validate that body is not empty or just whitespace."""
-        if not v or not v.strip():
-            raise ValueError('Comment body cannot be empty or whitespace only')
-        return v.strip()
+    body: str = Field(..., max_length=MAX_COMMENT_BODY_LENGTH)
 
 
 class CommentCreate(CommentBase):
-    """Schema for creating a comment."""
-
     pass
 
 
-class CommentResponse(BaseModel):
-    """Response schema for a single comment."""
-
-    id: int
-    createdAt: datetime
-    updatedAt: datetime
-    body: str
-    author: ProfileResponse
-
-    model_config = ConfigDict(from_attributes=True)
-
-
-class CommentCreateRequest(BaseModel):
-    """Wrapper for comment creation request."""
-
+class CommentCreateWrapper(BaseModel):
+    """Wrapper for nested comment creation."""
     comment: CommentCreate
 
 
-class CommentResponseWrapper(BaseModel):
-    """Wrapper for single comment response."""
+class CommentResponse(CommentBase):
+    id: int
+    createdAt: datetime
+    updatedAt: datetime
+    author: ProfileSchema
 
+    model_config = ConfigDict(from_attributes=True, populate_by_name=True)
+
+
+class CommentResponseWrapper(BaseModel):
     comment: CommentResponse
 
 
 class CommentListResponse(BaseModel):
-    """Response schema for comment list."""
-
     comments: List[CommentResponse]
+
+
+class TagsResponse(BaseModel):
+    tags: List[str]
