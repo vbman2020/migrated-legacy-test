@@ -1,5 +1,14 @@
+# Git
+.git
+.gitignore
+.gitattributes
+
+# CI/CD
+.github
+.gitlab-ci.yml
+
 # Python
-__pycache__/
+__pycache__
 *.py[cod]
 *$py.class
 *.so
@@ -25,19 +34,11 @@ PIPFILE.lock
 
 # Virtual environments
 venv/
-env/
-ENV/
-env.bak/
-venv.bak/
 .venv/
-
-# IDEs
-.vscode/
-.idea/
-*.swp
-*.swo
-*~
-.DS_Store
+ENV/
+env/
+.env
+.venv
 
 # Testing
 .pytest_cache/
@@ -50,29 +51,21 @@ coverage.xml
 *.cover
 .hypothesis/
 
-# Environment
-.env
-.env.*
-!.env.example
-
-# Git
-.git/
-.gitignore
-.gitattributes
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
 
 # Documentation
-*.md
-README*
-LICENSE
 docs/
-
-# CI/CD
-.github/
-.gitlab-ci.yml
-.travis.yml
+*.md
+LICENSE
 
 # Docker
-Dockerfile*
+Docker*
 docker-compose*.yml
 .dockerignore
 
@@ -85,10 +78,11 @@ logs/
 *.sqlite
 *.sqlite3
 
+# Environment
+.env.local
+.env.*.local
+
 # Misc
-.mypy_cache/
-.dmypy.json
-dmypy.json
-.ruff_cache/
-.bandit
-node_modules/
+.cache/
+tmp/
+temp/

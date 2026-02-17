@@ -1,161 +1,208 @@
-# Conduit API - FastAPI Implementation
+# RealWorld FastAPI Backend
 
-A real-world FastAPI application implementing the [RealWorld](https://github.com/gothinkster/realworld) spec.
+![CI/CD Pipeline](https://github.com/yourusername/realworld-fastapi/workflows/CI/CD%20Pipeline/badge.svg)
+![Python Version](https://img.shields.io/badge/python-3.12+-blue.svg)
+![FastAPI Version](https://img.shields.io/badge/fastapi-0.115+-green.svg)
+
+Modern FastAPI implementation of the [RealWorld](https://github.com/gothinkster/realworld) backend spec.
 
 ## Features
 
-- 🚀 **FastAPI** - Modern, fast (high-performance) web framework
-- 🗃️ **SQLAlchemy 2.0** - SQL toolkit and ORM
-- 🔄 **Alembic** - Database migrations
-- 🔐 **JWT Authentication** - Secure token-based auth
-- 📦 **PostgreSQL** - Robust relational database
-- ⚡ **Redis** - Fast caching layer
-- 🐳 **Docker** - Containerized deployment
-- ✅ **Pytest** - Comprehensive test suite
-- 🔍 **Ruff** - Fast Python linter
+- ✨ **FastAPI 0.115+** with async/await support
+- 🗄️ **PostgreSQL 16** with SQLAlchemy 2.0
+- 🔐 **JWT Authentication** with python-jose
+- 📝 **Alembic** migrations
+- 🐳 **Docker** & **Docker Compose** for local development
+- 🧪 **pytest** with 80%+ coverage
+- 🔍 **Ruff** for linting and formatting
+- 🚀 **GitHub Actions** CI/CD pipeline
+- 📦 **Redis** for caching
 
 ## Quick Start
 
 ### Prerequisites
 
+- Python 3.12+
 - Docker & Docker Compose
-- Python 3.12+ (for local development)
+- PostgreSQL 16 (or use Docker)
 
-### Run with Docker Compose
+### Local Development with Docker
 
-1. Clone the repository:
-```bash
-git clone <repository-url>
-cd conduit-api
-```
+1. **Clone the repository**
+   ```bash
+   git clone https://github.com/yourusername/realworld-fastapi.git
+   cd realworld-fastapi
+   ```
 
-2. Copy environment variables:
-```bash
-cp .env.example .env
-```
+2. **Create environment file**
+   ```bash
+   cp .env.example .env
+   # Edit .env with your configuration
+   ```
 
-3. Start all services:
-```bash
-docker-compose up -d
-```
+3. **Start services**
+   ```bash
+   docker-compose up -d
+   ```
 
-4. API will be available at `http://localhost:8000`
-5. API documentation at `http://localhost:8000/docs`
+4. **Access the API**
+   - API: http://localhost:8000
+   - API Docs: http://localhost:8000/docs
+   - ReDoc: http://localhost:8000/redoc
+   - PGAdmin: http://localhost:5050 (use `--profile tools`)
 
-### Local Development
+### Local Development without Docker
 
-1. Create virtual environment:
-```bash
-python -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
-```
+1. **Install dependencies**
+   ```bash
+   pip install -r requirements.txt
+   ```
 
-2. Install dependencies:
-```bash
-pip install -r requirements.txt
-```
+2. **Set up database**
+   ```bash
+   # Create PostgreSQL database
+   createdb realworld
+   
+   # Run migrations
+   alembic upgrade head
+   ```
 
-3. Start PostgreSQL and Redis:
-```bash
-docker-compose up -d postgres redis
-```
-
-4. Run migrations:
-```bash
-alembic upgrade head
-```
-
-5. Start development server:
-```bash
-uvicorn app.main:app --reload
-```
+3. **Run the application**
+   ```bash
+   uvicorn app.main:app --reload
+   ```
 
 ## Testing
 
-Run the test suite:
+### Run all tests
 ```bash
 pytest tests/ -v
 ```
 
-With coverage:
+### Run with coverage
 ```bash
-pytest tests/ -v --cov=app --cov-report=html
+pytest tests/ --cov=app --cov-report=html
+```
+
+### Run specific test file
+```bash
+pytest tests/test_auth.py -v
 ```
 
 ## Code Quality
 
-Run linter:
+### Linting
 ```bash
-ruff check .
+ruff check app/ tests/
 ```
 
-Format code:
+### Formatting
 ```bash
-ruff format .
+ruff format app/ tests/
 ```
 
-## API Endpoints
+### Type checking
+```bash
+mypy app/
+```
 
-### Authentication
-- `POST /api/users` - Register
-- `POST /api/users/login` - Login
-- `GET /api/user` - Get current user
-- `PUT /api/user` - Update user
+## Database Migrations
 
-### Profiles
-- `GET /api/profiles/{username}` - Get profile
-- `POST /api/profiles/{username}/follow` - Follow user
-- `DELETE /api/profiles/{username}/follow` - Unfollow user
+### Create a new migration
+```bash
+alembic revision --autogenerate -m "description"
+```
 
-### Articles
-- `GET /api/articles` - List articles
-- `POST /api/articles` - Create article
-- `GET /api/articles/{slug}` - Get article
-- `PUT /api/articles/{slug}` - Update article
-- `DELETE /api/articles/{slug}` - Delete article
-- `POST /api/articles/{slug}/favorite` - Favorite article
-- `DELETE /api/articles/{slug}/favorite` - Unfavorite article
+### Apply migrations
+```bash
+alembic upgrade head
+```
 
-### Comments
-- `POST /api/articles/{slug}/comments` - Add comment
-- `GET /api/articles/{slug}/comments` - List comments
-- `DELETE /api/articles/{slug}/comments/{id}` - Delete comment
+### Rollback migration
+```bash
+alembic downgrade -1
+```
 
-### Tags
-- `GET /api/tags` - List tags
+## API Documentation
+
+Once the application is running, visit:
+- Swagger UI: http://localhost:8000/docs
+- ReDoc: http://localhost:8000/redoc
 
 ## Project Structure
 
 ```
 .
 ├── app/
-│   ├── main.py              # FastAPI app entry point
-│   ├── config.py            # Configuration settings
-│   ├── database.py          # Database connection
+│   ├── main.py              # FastAPI application entry point
+│   ├── config.py            # Configuration and settings
+│   ├── database.py          # Database connection and session
+│   ├── dependencies.py      # Shared dependencies
 │   ├── auth/                # Authentication module
 │   ├── articles/            # Articles module
 │   ├── profiles/            # Profiles module
 │   └── core/                # Core utilities
-├── alembic/                 # Database migrations
+├── migrations/              # Alembic migrations
 ├── tests/                   # Test suite
-├── docker-compose.yml       # Docker services
-├── Dockerfile              # Container definition
-└── requirements.txt        # Python dependencies
+├── docker-compose.yml       # Docker Compose configuration
+├── Dockerfile               # Multi-stage Docker build
+├── requirements.txt         # Python dependencies
+└── alembic.ini             # Alembic configuration
 ```
 
 ## Environment Variables
 
 See `.env.example` for all available configuration options.
 
-## CI/CD
+Key variables:
+- `DATABASE_URL`: PostgreSQL connection string
+- `SECRET_KEY`: JWT secret key (generate with `openssl rand -hex 32`)
+- `REDIS_URL`: Redis connection string
+- `ALLOWED_ORIGINS`: CORS allowed origins
 
-GitHub Actions pipeline includes:
-- ✅ Linting with Ruff
-- ✅ Tests with Pytest
-- ✅ PostgreSQL service container
-- ✅ Code coverage reporting
-- ✅ Docker image build & push
+## CI/CD Pipeline
+
+The GitHub Actions pipeline automatically:
+1. ✅ Runs linting (Ruff)
+2. ✅ Runs type checking (mypy)
+3. ✅ Runs tests with PostgreSQL service
+4. ✅ Generates coverage reports
+5. ✅ Builds Docker image
+6. ✅ Runs security scans (Bandit, Safety)
+
+## Deployment
+
+### Docker
+```bash
+docker build -t realworld-fastapi .
+docker run -p 8000:8000 --env-file .env realworld-fastapi
+```
+
+### Production Considerations
+
+- Use a production WSGI server (uvicorn with Gunicorn)
+- Enable HTTPS/TLS
+- Set `DEBUG=false`
+- Use strong `SECRET_KEY`
+- Configure proper CORS origins
+- Set up database backups
+- Enable monitoring and logging
+- Use environment-specific configurations
+
+## Contributing
+
+1. Fork the repository
+2. Create a feature branch (`git checkout -b feature/amazing-feature`)
+3. Commit your changes (`git commit -m 'Add amazing feature'`)
+4. Push to the branch (`git push origin feature/amazing-feature`)
+5. Open a Pull Request
 
 ## License
 
-MIT
+MIT License - see LICENSE file for details
+
+## Acknowledgments
+
+- [RealWorld](https://github.com/gothinkster/realworld) for the API spec
+- [FastAPI](https://fastapi.tiangolo.com/) framework
+- [SQLAlchemy](https://www.sqlalchemy.org/) ORM
