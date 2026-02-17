@@ -1,123 +1,145 @@
-"""FastAPI router for authentication endpoints."""
+"""FastAPI router for authentication endpoints.
+
+Implements RealWorld API specification for user authentication:
+    - POST /api/users - Register new user
+    - POST /api/users/login - Login existing user
+    - GET /api/user - Get current authenticated user
+    - PUT /api/user - Update current authenticated user
+
+All endpoints follow the RealWorld API format with requests/responses
+wrapped in a 'user' object.
+"""
+
+from typing import Annotated
 import logging
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.exc import IntegrityError
 
-from app.auth.dependencies import get_current_user
 from app.auth.schemas import (
-    UserRegistrationRequest,
-    UserLoginRequest,
-    UserUpdateRequest,
+    UserCreateWrapper,
+    UserLoginWrapper,
+    UserResponseWrapper,
+    UserUpdateWrapper,
     UserResponse,
-    UserResponseWrapper
 )
-from app.auth.service import auth_service
-from app.database import get_db
+from app.auth.service import (
+    authenticate_user,
+    create_user,
+    get_user_by_email,
+    get_user_by_username,
+    generate_token_for_user,
+    update_user,
+)
+from app.auth.models import User
+from app.dependencies import get_db, get_current_user
 
-
+# Configure logging for authentication events
 logger = logging.getLogger(__name__)
 
-router = APIRouter()
+router = APIRouter(prefix="/api", tags=["authentication"])
 
 
 @router.post(
     "/users",
     response_model=UserResponseWrapper,
     status_code=status.HTTP_201_CREATED,
-    tags=["Authentication"],
     summary="Register a new user",
-    description="Register a new user account with username, email, and password. "
-                "Creates a user profile automatically."
+    description="Register a new user with email, username, and password. Returns user data with JWT token.",
+    responses={
+        201: {
+            "description": "User successfully registered",
+            "content": {
+                "application/json": {
+                    "example": {
+                        "user": {
+                            "email": "user@example.com",
+                            "username": "johndoe",
+                            "bio": None,
+                            "image": None,
+                            "token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
+                        }
+                    }
+                }
+            }
+        },
+        422: {
+            "description": "Validation error or user already exists",
+            "content": {
+                "application/json": {
+                    "example": {
+                        "detail": "A user with this email already exists."
+                    }
+                }
+            }
+        }
+    }
 )
 async def register_user(
-    request: UserRegistrationRequest,
-    db: AsyncSession = Depends(get_db)
+    user_data: UserCreateWrapper,
+    db: Annotated[AsyncSession, Depends(get_db)]
 ) -> UserResponseWrapper:
     """Register a new user.
     
-    Creates a new user account with the provided credentials and automatically
-    creates an associated profile. Returns the user data with a JWT token.
+    Validates that email and username are unique, then creates new user
+    with hashed password. Returns user data with JWT authentication token.
     
     Args:
-        request: User registration data containing username, email, and password.
-        db: Database session.
-    
+        user_data: User registration data wrapped in user object (RealWorld API format)
+        db: Database session (injected dependency)
+        
     Returns:
-        UserResponseWrapper: Created user data with JWT token.
-    
+        UserResponseWrapper containing user data and JWT token
+        
     Raises:
-        HTTPException: 422 if username or email already exists.
-        HTTPException: 422 if validation fails (weak password, invalid email, etc.).
+        HTTPException 422: If email or username already exists
+        HTTPException 422: If validation fails (handled by Pydantic)
     """
+    user_create = user_data.user
+    
     # Check if email already exists
-    existing_user = await auth_service.get_user_by_email(db, request.user.email)
+    existing_user = await get_user_by_email(db, user_create.email)
     if existing_user:
-        logger.warning(f"Registration attempt with existing email: {request.user.email}")
+        logger.info(f"Registration attempt with existing email: {user_create.email}")
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="User with this email already exists"
+            detail="A user with this email already exists."
         )
     
     # Check if username already exists
-    existing_user = await auth_service.get_user_by_username(db, request.user.username)
+    existing_user = await get_user_by_username(db, user_create.username)
     if existing_user:
-        logger.warning(f"Registration attempt with existing username: {request.user.username}")
+        logger.info(f"Registration attempt with existing username: {user_create.username}")
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="User with this username already exists"
+            detail="A user with this username already exists."
         )
     
+    # Create new user
     try:
-        # Create user with associated profile
-        user = await auth_service.create_user(
-            db=db,
-            username=request.user.username,
-            email=request.user.email,
-            password=request.user.password
-        )
-    except IntegrityError:
-        # Handle race condition where user was created between checks
-        logger.error(f"Race condition in user registration: {request.user.email}")
+        new_user = await create_user(db, user_create)
+        logger.info(f"Successfully registered user: {new_user.username} (ID: {new_user.id})")
+    except IntegrityError as e:
+        # Race condition: user was created between our checks and the insert
+        logger.warning(f"Race condition during user registration: {str(e)}")
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="User with this email or username already exists"
-        )
-    except ValueError as e:
-        # Handle password validation errors
-        logger.warning(f"Invalid password in registration: {str(e)}")
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=str(e)
-        )
-    except Exception as e:
-        logger.error(f"Unexpected error in user registration: {str(e)}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to create user account"
+            detail="A user with this email or username already exists."
         )
     
     # Generate JWT token
-    try:
-        token = auth_service.create_access_token(user.id)
-    except ValueError as e:
-        logger.error(f"Token creation failed: {str(e)}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to generate authentication token"
-        )
+    token = generate_token_for_user(new_user)
     
     # Build response
     user_response = UserResponse(
-        email=user.email,
-        username=user.username,
-        bio=user.profile.bio if user.profile else "",
-        image=user.profile.image if user.profile else None,
+        email=new_user.email,
+        username=new_user.username,
+        bio=new_user.bio,
+        image=new_user.image,
         token=token
     )
     
-    logger.info(f"User registered successfully: {user.email}")
     return UserResponseWrapper(user=user_response)
 
 
@@ -125,59 +147,93 @@ async def register_user(
     "/users/login",
     response_model=UserResponseWrapper,
     status_code=status.HTTP_200_OK,
-    tags=["Authentication"],
-    summary="Login existing user",
-    description="Authenticate with email and password to receive a JWT token. "
-                "Token must be included in Authorization header for protected endpoints."
+    summary="Login user",
+    description="Authenticate user with email and password. Returns user data with JWT token.",
+    responses={
+        200: {
+            "description": "Login successful",
+            "content": {
+                "application/json": {
+                    "example": {
+                        "user": {
+                            "email": "user@example.com",
+                            "username": "johndoe",
+                            "bio": "I love coding!",
+                            "image": "https://example.com/avatar.jpg",
+                            "token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
+                        }
+                    }
+                }
+            }
+        },
+        422: {
+            "description": "Invalid credentials or inactive user",
+            "content": {
+                "application/json": {
+                    "example": {
+                        "detail": "A user with this email and password was not found."
+                    }
+                }
+            }
+        }
+    }
 )
 async def login_user(
-    request: UserLoginRequest,
-    db: AsyncSession = Depends(get_db)
+    user_data: UserLoginWrapper,
+    db: Annotated[AsyncSession, Depends(get_db)]
 ) -> UserResponseWrapper:
-    """Authenticate a user and return a JWT token.
+    """Login an existing user.
     
-    Validates the user's credentials and returns a JWT token for accessing
-    protected endpoints. Generic error messages prevent user enumeration.
+    Authenticates user credentials and returns user data with JWT token.
+    Uses timing-safe password comparison to prevent timing attacks.
+    Implements account lockout after repeated failed attempts.
     
     Args:
-        request: User login credentials (email and password).
-        db: Database session.
-    
+        user_data: User login credentials wrapped in user object (RealWorld API format)
+        db: Database session (injected dependency)
+        
     Returns:
-        UserResponseWrapper: User data with JWT token.
-    
+        UserResponseWrapper containing user data and JWT token
+        
     Raises:
-        HTTPException: 422 if authentication fails (invalid credentials or inactive account).
+        HTTPException 422: If credentials are invalid, user is inactive, or account is locked
+        
+    Security Notes:
+        - Does not reveal whether email or password was incorrect
+        - Performs constant-time password verification
+        - Implements account lockout after 5 failed attempts
+        - Logs failed authentication attempts for monitoring
     """
-    user = await auth_service.authenticate_user(
-        db=db,
-        email=request.user.email,
-        password=request.user.password
-    )
+    user_login = user_data.user
+    
+    # Authenticate user (timing-safe password verification + account lockout)
+    user = await authenticate_user(db, user_login.email, user_login.password)
     
     if not user:
-        # Generic error message to prevent user enumeration
+        logger.info(f"Failed login attempt for email: {user_login.email}")
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail="A user with this email and password was not found."
         )
     
-    # Generate JWT token
-    try:
-        token = auth_service.create_access_token(user.id)
-    except ValueError as e:
-        logger.error(f"Token creation failed for user {user.email}: {str(e)}")
+    # Check if user is active (redundant check since authenticate_user does this, but explicit is good)
+    if not user.is_active:
+        logger.warning(f"Login attempt for deactivated user: {user.email}")
         raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to generate authentication token"
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="This user has been deactivated."
         )
+    
+    # Generate JWT token
+    token = generate_token_for_user(user)
+    logger.info(f"Successful login for user: {user.username} (ID: {user.id})")
     
     # Build response
     user_response = UserResponse(
         email=user.email,
         username=user.username,
-        bio=user.profile.bio if user.profile else "",
-        image=user.profile.image if user.profile else None,
+        bio=user.bio,
+        image=user.image,
         token=token
     )
     
@@ -188,45 +244,63 @@ async def login_user(
     "/user",
     response_model=UserResponseWrapper,
     status_code=status.HTTP_200_OK,
-    tags=["Authentication"],
     summary="Get current user",
-    description="Get the currently authenticated user's information. "
-                "Requires valid JWT token in Authorization header."
+    description="Get the currently authenticated user's information. Requires authentication.",
+    responses={
+        200: {
+            "description": "Current user retrieved successfully",
+            "content": {
+                "application/json": {
+                    "example": {
+                        "user": {
+                            "email": "user@example.com",
+                            "username": "johndoe",
+                            "bio": "I love coding!",
+                            "image": "https://example.com/avatar.jpg",
+                            "token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
+                        }
+                    }
+                }
+            }
+        },
+        401: {
+            "description": "Not authenticated or invalid token",
+            "content": {
+                "application/json": {
+                    "example": {
+                        "detail": "Could not validate credentials"
+                    }
+                }
+            }
+        }
+    }
 )
 async def get_current_user_info(
-    current_user = Depends(get_current_user)
+    current_user: Annotated[User, Depends(get_current_user)]
 ) -> UserResponseWrapper:
-    """Get the current authenticated user's information.
+    """Get current authenticated user.
     
-    Returns the user profile data along with a fresh JWT token.
-    Requires authentication via Bearer token in Authorization header.
+    Returns user data for the currently authenticated user based on JWT token.
+    Generates a fresh token in the response.
     
     Args:
-        current_user: Currently authenticated user from dependency.
-    
+        current_user: Currently authenticated user from JWT token (injected dependency)
+        
     Returns:
-        UserResponseWrapper: Current user data with fresh JWT token.
-    
+        UserResponseWrapper containing user data and fresh JWT token
+        
     Raises:
-        HTTPException: 401 if not authenticated or token invalid.
-        HTTPException: 403 if user account is inactive.
+        HTTPException 401: If token is invalid or expired (handled by get_current_user dependency)
     """
     # Generate fresh token
-    try:
-        token = auth_service.create_access_token(current_user.id)
-    except ValueError as e:
-        logger.error(f"Token creation failed for user {current_user.email}: {str(e)}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to generate authentication token"
-        )
+    token = generate_token_for_user(current_user)
     
     # Build response
     user_response = UserResponse(
         email=current_user.email,
         username=current_user.username,
-        bio=current_user.profile.bio if current_user.profile else "",
-        image=current_user.profile.image if current_user.profile else None,
+        bio=current_user.bio,
+        image=current_user.image,
         token=token
     )
     
@@ -237,110 +311,122 @@ async def get_current_user_info(
     "/user",
     response_model=UserResponseWrapper,
     status_code=status.HTTP_200_OK,
-    tags=["Authentication"],
     summary="Update current user",
-    description="Update the currently authenticated user's information including "
-                "email, username, password, bio, and profile image. "
-                "Requires valid JWT token in Authorization header."
+    description="Update the currently authenticated user's information. Requires authentication.",
+    responses={
+        200: {
+            "description": "User updated successfully",
+            "content": {
+                "application/json": {
+                    "example": {
+                        "user": {
+                            "email": "newemail@example.com",
+                            "username": "newusername",
+                            "bio": "Updated bio",
+                            "image": "https://example.com/new-avatar.jpg",
+                            "token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
+                        }
+                    }
+                }
+            }
+        },
+        401: {
+            "description": "Not authenticated or invalid token",
+            "content": {
+                "application/json": {
+                    "example": {
+                        "detail": "Could not validate credentials"
+                    }
+                }
+            }
+        },
+        422: {
+            "description": "Validation error or username/email already taken",
+            "content": {
+                "application/json": {
+                    "example": {
+                        "detail": "A user with this email already exists."
+                    }
+                }
+            }
+        }
+    }
 )
 async def update_current_user(
-    request: UserUpdateRequest,
-    current_user = Depends(get_current_user),
-    db: AsyncSession = Depends(get_db)
+    user_data: UserUpdateWrapper,
+    current_user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[AsyncSession, Depends(get_db)]
 ) -> UserResponseWrapper:
-    """Update the current authenticated user's information.
+    """Update current authenticated user.
     
-    Allows updating user credentials and profile information.
-    All fields are optional - only provided fields will be updated.
+    Allows user to update their profile information including:
+        - Email (validated for uniqueness)
+        - Username (validated for uniqueness)
+        - Password (re-hashed with bcrypt)
+        - Bio (sanitized for XSS prevention)
+        - Image URL (validated format, no data: or javascript: URLs)
     
     Args:
-        request: User update data (email, username, password, bio, image).
-        current_user: Currently authenticated user from dependency.
-        db: Database session.
-    
+        user_data: User update data wrapped in user object (RealWorld API format)
+        current_user: Currently authenticated user from JWT token (injected dependency)
+        db: Database session (injected dependency)
+        
     Returns:
-        UserResponseWrapper: Updated user data with fresh JWT token.
-    
+        UserResponseWrapper containing updated user data and fresh JWT token
+        
     Raises:
-        HTTPException: 401 if not authenticated or token invalid.
-        HTTPException: 403 if user account is inactive.
-        HTTPException: 422 if email or username is already taken by another user.
-        HTTPException: 422 if validation fails (weak password, invalid email, etc.).
+        HTTPException 401: If token is invalid or expired (handled by get_current_user dependency)
+        HTTPException 422: If email or username already taken by another user
+        HTTPException 422: If validation fails (handled by Pydantic)
+        
+    Note:
+        Only fields provided in the request will be updated.
+        Token is regenerated if email or username changes.
     """
-    # Check if email is being updated and if it's already taken
-    if request.user.email and request.user.email != current_user.email:
-        existing_user = await auth_service.get_user_by_email(db, request.user.email)
-        if existing_user:
-            logger.warning(
-                f"User {current_user.email} attempted to change to existing email: {request.user.email}"
-            )
+    user_update = user_data.user
+    
+    # Check if new email is already taken by another user
+    if user_update.email is not None and user_update.email != current_user.email:
+        existing_user = await get_user_by_email(db, user_update.email)
+        if existing_user and existing_user.id != current_user.id:
+            logger.info(f"User {current_user.id} attempted to update to existing email: {user_update.email}")
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                detail="User with this email already exists"
+                detail="A user with this email already exists."
             )
     
-    # Check if username is being updated and if it's already taken
-    if request.user.username and request.user.username != current_user.username:
-        existing_user = await auth_service.get_user_by_username(db, request.user.username)
-        if existing_user:
-            logger.warning(
-                f"User {current_user.email} attempted to change to existing username: {request.user.username}"
-            )
+    # Check if new username is already taken by another user
+    if user_update.username is not None and user_update.username != current_user.username:
+        existing_user = await get_user_by_username(db, user_update.username)
+        if existing_user and existing_user.id != current_user.id:
+            logger.info(f"User {current_user.id} attempted to update to existing username: {user_update.username}")
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                detail="User with this username already exists"
+                detail="A user with this username already exists."
             )
     
+    # Update user
     try:
-        # Update user and profile
-        updated_user = await auth_service.update_user(
-            db=db,
-            user=current_user,
-            email=request.user.email,
-            username=request.user.username,
-            password=request.user.password,
-            bio=request.user.bio,
-            image=request.user.image
-        )
-    except IntegrityError:
-        # Handle race condition
-        logger.error(f"Race condition in user update: {current_user.email}")
+        updated_user = await update_user(db, current_user, user_update)
+        logger.info(f"Successfully updated user: {updated_user.username} (ID: {updated_user.id})")
+    except IntegrityError as e:
+        # Race condition: username/email was taken between our check and the update
+        logger.warning(f"Race condition during user update: {str(e)}")
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="User with this email or username already exists"
-        )
-    except ValueError as e:
-        # Handle validation errors
-        logger.warning(f"Invalid data in user update: {str(e)}")
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail=str(e)
-        )
-    except Exception as e:
-        logger.error(f"Unexpected error in user update: {str(e)}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to update user account"
+            detail="A user with this email or username already exists."
         )
     
-    # Generate fresh token
-    try:
-        token = auth_service.create_access_token(updated_user.id)
-    except ValueError as e:
-        logger.error(f"Token creation failed for user {updated_user.email}: {str(e)}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to generate authentication token"
-        )
+    # Generate fresh token (important if email or username changed)
+    token = generate_token_for_user(updated_user)
     
     # Build response
     user_response = UserResponse(
         email=updated_user.email,
         username=updated_user.username,
-        bio=updated_user.profile.bio if updated_user.profile else "",
-        image=updated_user.profile.image if updated_user.profile else None,
+        bio=updated_user.bio,
+        image=updated_user.image,
         token=token
     )
     
-    logger.info(f"User updated successfully: {updated_user.email}")
     return UserResponseWrapper(user=user_response)
