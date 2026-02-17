@@ -1,35 +1,32 @@
-version: '3.8'
+version: '3.9'
 
 services:
-  # PostgreSQL database
-  db:
+  # PostgreSQL Database
+  postgres:
     image: postgres:16-alpine
-    container_name: conduit_db
-    restart: unless-stopped
+    container_name: realworld-postgres
     environment:
-      POSTGRES_USER: ${POSTGRES_USER:-conduit}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-conduit_dev_password}
-      POSTGRES_DB: ${POSTGRES_DB:-conduit}
+      POSTGRES_USER: ${POSTGRES_USER:-realworld}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-realworld_secret}
+      POSTGRES_DB: ${POSTGRES_DB:-realworld}
     ports:
-      - "${POSTGRES_PORT:-5432}:5432"
+      - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-conduit}"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-realworld}"]
       interval: 10s
       timeout: 5s
       retries: 5
     networks:
-      - conduit_network
+      - realworld-network
 
-  # Redis cache
+  # Redis Cache
   redis:
     image: redis:7-alpine
-    container_name: conduit_redis
-    restart: unless-stopped
-    command: redis-server --appendonly yes
+    container_name: realworld-redis
     ports:
-      - "${REDIS_PORT:-6379}:6379"
+      - "6379:6379"
     volumes:
       - redis_data:/data
     healthcheck:
@@ -38,83 +35,79 @@ services:
       timeout: 5s
       retries: 5
     networks:
-      - conduit_network
+      - realworld-network
+    command: redis-server --appendonly yes
 
-  # FastAPI application
+  # FastAPI Application
   app:
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: conduit_app
-    restart: unless-stopped
-    ports:
-      - "${APP_PORT:-8000}:8000"
+    container_name: realworld-api
     environment:
-      # Application settings
-      APP_NAME: ${APP_NAME:-Conduit}
-      DEBUG: ${DEBUG:-false}
-      ENVIRONMENT: ${ENVIRONMENT:-development}
-      
-      # Database configuration
-      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-conduit}:${POSTGRES_PASSWORD:-conduit_dev_password}@db:5432/${POSTGRES_DB:-conduit}
-      
-      # Redis configuration
+      # Database
+      DATABASE_URL: postgresql://${POSTGRES_USER:-realworld}:${POSTGRES_PASSWORD:-realworld_secret}@postgres:5432/${POSTGRES_DB:-realworld}
+      # Redis
       REDIS_URL: redis://redis:6379/0
-      
-      # JWT settings
+      # Application
       SECRET_KEY: ${SECRET_KEY:-your-secret-key-change-in-production}
       ALGORITHM: ${ALGORITHM:-HS256}
       ACCESS_TOKEN_EXPIRE_MINUTES: ${ACCESS_TOKEN_EXPIRE_MINUTES:-30}
-      
-      # CORS settings
-      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-http://localhost:3000,http://localhost:8080}
+      # Environment
+      ENVIRONMENT: ${ENVIRONMENT:-development}
+      DEBUG: ${DEBUG:-true}
+      # CORS
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-http://localhost:3000,http://localhost:4200}
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./app:/app/app
+      - ./migrations:/app/migrations
+      - ./alembic.ini:/app/alembic.ini
     depends_on:
-      db:
+      postgres:
         condition: service_healthy
       redis:
         condition: service_healthy
-    volumes:
-      - ./app:/app/app
-      - ./alembic:/app/alembic
-      - ./alembic.ini:/app/alembic.ini
+    networks:
+      - realworld-network
     command: >
       sh -c "
-        echo 'Waiting for database...'
-        sleep 5
-        echo 'Running migrations...'
-        alembic upgrade head
-        echo 'Starting application...'
+        echo 'Waiting for database...' &&
+        sleep 5 &&
+        echo 'Running database migrations...' &&
+        alembic upgrade head &&
+        echo 'Starting application...' &&
         uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
       "
-    networks:
-      - conduit_network
 
-  # Database migration service (one-time)
-  migrate:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    container_name: conduit_migrate
+  # PGAdmin for database management (optional)
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    container_name: realworld-pgadmin
     environment:
-      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-conduit}:${POSTGRES_PASSWORD:-conduit_dev_password}@db:5432/${POSTGRES_DB:-conduit}
-    depends_on:
-      db:
-        condition: service_healthy
+      PGADMIN_DEFAULT_EMAIL: ${PGADMIN_EMAIL:-admin@realworld.com}
+      PGADMIN_DEFAULT_PASSWORD: ${PGADMIN_PASSWORD:-admin}
+      PGADMIN_CONFIG_SERVER_MODE: 'False'
+    ports:
+      - "5050:80"
     volumes:
-      - ./alembic:/app/alembic
-      - ./alembic.ini:/app/alembic.ini
-    command: alembic upgrade head
+      - pgadmin_data:/var/lib/pgadmin
+    depends_on:
+      - postgres
     networks:
-      - conduit_network
+      - realworld-network
     profiles:
-      - migration
+      - tools
 
 volumes:
   postgres_data:
     driver: local
   redis_data:
     driver: local
+  pgadmin_data:
+    driver: local
 
 networks:
-  conduit_network:
+  realworld-network:
     driver: bridge
